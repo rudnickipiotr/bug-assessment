@@ -1,0 +1,1008 @@
+#!/usr/bin/env python3
+"""
+CIBugLog Query Tool
+-------------------
+GUI application for querying and analyzing CI test results from CIBugLog.
+
+Requirements:
+    pip install requests beautifulsoup4
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
+import urllib.parse
+import re
+import webbrowser
+import csv
+import io
+import json
+import os
+import sys
+from pathlib import Path
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
+try:
+    from requests_negotiate_sspi import HttpNegotiateAuth
+    HAS_SSPI = True
+except ImportError:
+    HAS_SSPI = False
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+try:
+    from bs4 import BeautifulSoup
+    HAS_BS4 = True
+except ImportError:
+    HAS_BS4 = False
+
+CIBUGLOG_BASE = "https://gfx-ci-internal.igk.intel.com/cibuglog/results/all"
+PAGE_SIZE = 100
+PROXIES = {
+    "http":  "http://proxy-dmz.intel.com:912",
+    "https": "http://proxy-dmz.intel.com:912",
+}
+HISTORY_FILE = Path(__file__).with_name("cibuglog_history.json")
+
+STATUS_COLORS = {
+    "pass":       ("#d4edda", "#155724"),
+    "fail":       ("#f8d7da", "#721c24"),
+    "dmesg":      ("#fce4e4", "#721c24"),
+    "skip":       ("#fff3cd", "#856404"),
+    "incomplete": ("#e2e3e5", "#383d41"),
+    "notrun":     ("#e2e3e5", "#383d41"),
+}
+
+
+def classify_status(status_text: str) -> str:
+    sl = status_text.lower()
+    if "dmesg-fail" in sl or ("dmesg" in sl and "fail" in sl) or "abort" in sl:
+        return "dmesg"
+    if "fail" in sl:
+        return "fail"
+    if "pass" in sl:
+        return "pass"
+    if "skip" in sl:
+        return "skip"
+    if "incomplete" in sl or "notrun" in sl:
+        return "incomplete"
+    return ""
+
+
+def clean_cell(text: str) -> str:
+    text = re.sub(r"\(external\s*URL\)", "", text)
+    text = re.sub(r"^IGT:\s*", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+class CIBugLogApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("CIBugLog & JIRA Query Tool")
+        self.geometry("1440x900")
+        self.minsize(1000, 650)
+
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+        style.configure("TLabelframe.Label", font=("Segoe UI", 9, "bold"))
+
+        self._sort_reverse = {}
+        self._query_history: list[str] = []
+        self._field_history: dict[str, list[str]] = {
+            "test": [], "machine": [], "runconfig": [], "date": []
+        }
+        
+        # Create notebook for tabs
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True)
+        
+        # JIRA Query tab (first)
+        self.jira_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.jira_frame, text="JIRA Query")
+        
+        # CIBugLog tab (second)
+        self.cibuglog_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.cibuglog_frame, text="CIBugLog")
+        
+        self._build_jira_ui()
+        self._build_cibuglog_ui()
+        self._load_history()
+        self._check_deps()
+
+    # ------------------------------------------------------------------ UI --
+
+    def _build_cibuglog_ui(self):
+        # ---- Filter frame ----
+        fframe = ttk.LabelFrame(self.cibuglog_frame, text=" Query Filters ", padding=(12, 6))
+        fframe.pack(fill="x", padx=10, pady=(10, 4))
+        fframe.columnconfigure(3, weight=1)
+
+        for col, txt in enumerate(["Connector", "Field", "Match type", "Value"]):
+            ttk.Label(fframe, text=txt, font=("Segoe UI", 9, "bold")).grid(
+                row=0, column=col, padx=8, pady=(2, 4), sticky="w")
+
+        # Row 1 – test_name
+        ttk.Label(fframe, text="(first)", foreground="gray").grid(
+            row=1, column=0, padx=8, pady=3, sticky="w")
+        ttk.Label(fframe, text="test_name").grid(
+            row=1, column=1, padx=8, pady=3, sticky="w")
+        self.test_match = self._combo(fframe, ["= (exact)", "~= (regex/contains)"], "= (exact)", 1, 2)
+        self.test_value = ttk.Combobox(fframe, font=("Consolas", 10))
+        self.test_value.grid(row=1, column=3, padx=8, pady=3, sticky="ew")
+        ttk.Label(fframe, text="e.g.  igt@xe_eudebug_online@basic-breakpoint",
+                  foreground="gray").grid(row=1, column=4, padx=4, sticky="w")
+
+        # Row 2 – machine_name
+        self.machine_conn = self._combo(fframe, ["AND", "AND NOT"], "AND", 2, 0)
+        ttk.Label(fframe, text="machine_name").grid(
+            row=2, column=1, padx=8, pady=3, sticky="w")
+        self.machine_match = self._combo(fframe, ["= (exact)", "~= (regex/contains)"], "~= (regex/contains)", 2, 2)
+        self.machine_value = ttk.Combobox(fframe, font=("Consolas", 10))
+        self.machine_value.grid(row=2, column=3, padx=8, pady=3, sticky="ew")
+        ttk.Label(fframe, text="e.g.  jgs  or  cri|jgs  or  BMG",
+                  foreground="gray").grid(row=2, column=4, padx=4, sticky="w")
+
+        # Row 3 – runconfig_name
+        self.rc_conn = self._combo(fframe, ["AND", "AND NOT"], "AND NOT", 3, 0)
+        ttk.Label(fframe, text="runconfig_name").grid(
+            row=3, column=1, padx=8, pady=3, sticky="w")
+        self.rc_match = self._combo(fframe, ["= (exact)", "~= (regex/contains)"], "~= (regex/contains)", 3, 2)
+        self.rc_value = ttk.Combobox(fframe, font=("Consolas", 10))
+        self.rc_value.grid(row=3, column=3, padx=8, pady=3, sticky="ew")
+        ttk.Label(fframe, text="e.g.  kasan|upstream",
+                  foreground="gray").grid(row=3, column=4, padx=4, sticky="w")
+
+        # Row 4 – date filter
+        ttk.Label(fframe, text="AND").grid(row=4, column=0, padx=8, sticky="w")
+        ttk.Label(fframe, text="runconfig_added_on >").grid(
+            row=4, column=1, padx=8, pady=3, sticky="w")
+        ttk.Label(fframe, text="datetime( ... )").grid(
+            row=4, column=2, padx=8, sticky="w")
+        date_row = ttk.Frame(fframe)
+        date_row.grid(row=4, column=3, padx=8, pady=3, sticky="w")
+        self.date_value = ttk.Combobox(date_row, width=18, font=("Consolas", 10))
+        self.date_value.grid(row=0, column=0)
+        ttk.Label(date_row, text="  e.g. 2026-03-31   (optional)",
+                  foreground="gray").grid(row=0, column=1, padx=4)
+
+        # ---- Query preview ----
+        pframe = ttk.LabelFrame(self.cibuglog_frame, text=" Query Preview ", padding=(10, 4))
+        pframe.pack(fill="x", padx=10, pady=4)
+        pframe.columnconfigure(0, weight=1)
+
+        self.query_var = tk.StringVar()
+        self.query_entry = ttk.Combobox(pframe, textvariable=self.query_var,
+                                        font=("Consolas", 10), values=[],
+                                        postcommand=self._refresh_history_dropdown)
+        self.query_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.query_entry.bind("<KeyRelease>", self._on_query_edit)
+        self.query_entry.bind("<<Paste>>",    self._on_query_paste)
+        self.query_entry.bind("<<ComboboxSelected>>", self._on_history_select)
+        ttk.Button(pframe, text="Parse ↑", width=8,
+                   command=self._parse_query_to_fields).grid(row=0, column=1, padx=2)
+        ttk.Button(pframe, text="Copy", width=7,
+                   command=self._copy_query).grid(row=0, column=2, padx=2)
+        ttk.Button(pframe, text="Browser", width=8,
+                   command=self._open_browser).grid(row=0, column=3, padx=2)
+
+        # ---- Action bar ----
+        bframe = ttk.Frame(self.cibuglog_frame)
+        bframe.pack(fill="x", padx=10, pady=4)
+
+        ttk.Button(bframe, text="▶  Fetch Results", command=self._fetch_async,
+                   style="Accent.TButton").pack(side="left", padx=(0, 6))
+        ttk.Button(bframe, text="Export CSV",
+                   command=self._export_csv).pack(side="left", padx=4)
+        ttk.Button(bframe, text="Clear All",
+                   command=self._clear_all).pack(side="left", padx=4)
+
+        self.use_proxy_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bframe, text="Use proxy",
+                        variable=self.use_proxy_var).pack(side="left", padx=8)
+
+        self.status_var = tk.StringVar(value="Ready")
+        self.status_lbl = ttk.Label(bframe, textvariable=self.status_var, foreground="gray")
+        self.status_lbl.pack(side="left", padx=16)
+
+        self.progress = ttk.Progressbar(bframe, mode="indeterminate", length=180)
+        self.progress.pack(side="right", padx=6)
+
+        # ---- Count / pagination label ----
+        self.count_var = tk.StringVar(value="")
+        ttk.Label(self.cibuglog_frame, textvariable=self.count_var,
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=12, pady=1)
+
+        # ---- Results table ----
+        tframe = ttk.Frame(self.cibuglog_frame)
+        tframe.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        tframe.rowconfigure(0, weight=1)
+        tframe.columnconfigure(0, weight=1)
+
+        cols = ("test", "runconfig", "tags", "status", "duration", "build", "issue")
+        self.tree = ttk.Treeview(tframe, columns=cols, show="headings", selectmode="extended")
+
+        col_cfg = [
+            ("test",      "Test Name",  340),
+            ("runconfig", "Runconfig",  220),
+            ("tags",      "Tags",       160),
+            ("status",    "Status",     110),
+            ("duration",  "Duration",    90),
+            ("build",     "Build",      220),
+            ("issue",     "Issue",      320),
+        ]
+        for cid, heading, width in col_cfg:
+            self.tree.heading(cid, text=heading,
+                              command=lambda c=cid: self._sort_column(c))
+            self.tree.column(cid, width=width, minwidth=60, stretch=True)
+
+        for key, (bg, fg) in STATUS_COLORS.items():
+            self.tree.tag_configure(key, background=bg, foreground=fg)
+
+        vsb = ttk.Scrollbar(tframe, orient="vertical",   command=self.tree.yview)
+        hsb = ttk.Scrollbar(tframe, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        # Context menu – rebuilt dynamically on each right-click
+        self._ctx = tk.Menu(self, tearoff=0)
+        self.tree.bind("<Button-3>", self._show_ctx)
+        self._ctx_col = None
+
+        # Auto-update preview
+        for w in (self.test_value, self.machine_value, self.rc_value, self.date_value):
+            w.bind("<KeyRelease>", lambda _: self._update_preview())
+            w.bind("<<ComboboxSelected>>", lambda _: self._update_preview())
+        for w in (self.test_match, self.machine_conn, self.machine_match,
+                  self.rc_conn, self.rc_match):
+            w.bind("<<ComboboxSelected>>", lambda _: self._update_preview())
+
+    def _build_jira_ui(self):
+        """Build JIRA Query tab with issues table."""
+        # Default JIRA query
+        default_jql = (
+            "project = VLK AND component = XeKMD AND component = \"Kernel - core\" "
+            "AND priority = Undecided AND Exposure = Unset AND status != Closed "
+            "AND status != Rejected AND type = Bug"
+        )
+        
+        # ---- Query Field ----
+        qframe = ttk.LabelFrame(self.jira_frame, text=" JQL Query ", padding=(10, 4))
+        qframe.pack(fill="x", padx=10, pady=(10, 4))
+        qframe.columnconfigure(0, weight=1)
+        
+        self.jira_query_text = tk.Text(qframe, font=("Consolas", 9), height=3, width=100)
+        self.jira_query_text.pack(fill="both", expand=False, padx=6, pady=4)
+        self.jira_query_text.insert("1.0", default_jql)
+        
+        # ---- Action Buttons ----
+        btn_frame = ttk.Frame(self.jira_frame)
+        btn_frame.pack(fill="x", padx=10, pady=(4, 4))
+        
+        ttk.Button(btn_frame, text="▶  Fetch Issues", 
+                   command=self._on_fetch_jira_clicked,
+                   style="Accent.TButton").pack(side="left", padx=(0, 6))
+        ttk.Button(btn_frame, text="Open in JIRA",
+                   command=self._on_open_jira_clicked).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Copy Query",
+                   command=self._on_copy_jira_clicked).pack(side="left", padx=4)
+        
+        self.jira_status_label = ttk.Label(btn_frame, text="Ready", foreground="gray")
+        self.jira_status_label.pack(side="left", padx=16)
+        
+        self.jira_progress = ttk.Progressbar(btn_frame, mode="indeterminate", length=180)
+        self.jira_progress.pack(side="right", padx=6)
+        
+        # ---- Count label ----
+        self.jira_count_var = tk.StringVar(value="")
+        ttk.Label(self.jira_frame, textvariable=self.jira_count_var,
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=12, pady=1)
+        
+        # ---- Results table ----
+        tframe = ttk.Frame(self.jira_frame)
+        tframe.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        tframe.rowconfigure(0, weight=1)
+        tframe.columnconfigure(0, weight=1)
+        
+        cols = ("key", "summary", "status", "priority", "assignee")
+        self.jira_tree = ttk.Treeview(tframe, columns=cols, show="headings", selectmode="extended")
+        
+        col_cfg = [
+            ("key",      "Key",       100),
+            ("summary",  "Summary",   500),
+            ("status",   "Status",    100),
+            ("priority", "Priority",  80),
+            ("assignee", "Assignee",  150),
+        ]
+        for cid, heading, width in col_cfg:
+            self.jira_tree.heading(cid, text=heading,
+                                   command=lambda c=cid: self._sort_jira_column(c))
+            self.jira_tree.column(cid, width=width, minwidth=60, stretch=True)
+        
+        vsb = ttk.Scrollbar(tframe, orient="vertical",   command=self.jira_tree.yview)
+        hsb = ttk.Scrollbar(tframe, orient="horizontal", command=self.jira_tree.xview)
+        self.jira_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        
+        self.jira_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        
+        # Store sort state for JIRA table
+        self._jira_sort_reverse = {}
+
+    def _get_jira_query(self) -> str:
+        """Get JQL query from text widget."""
+        return self.jira_query_text.get("1.0", "end").strip()
+
+    def _on_fetch_jira_clicked(self):
+        """Handle Fetch Issues button click."""
+        jql = self._get_jira_query()
+        if not jql:
+            messagebox.showwarning("Empty query", "Please enter a JQL query.")
+            return
+        self._fetch_jira_issues(jql)
+
+    def _on_open_jira_clicked(self):
+        """Handle Open in JIRA button click."""
+        jql = self._get_jira_query()
+        if not jql:
+            messagebox.showwarning("Empty query", "Please enter a JQL query.")
+            return
+        self._open_jira_search(jql)
+
+    def _on_copy_jira_clicked(self):
+        """Handle Copy Query button click."""
+        jql = self._get_jira_query()
+        if not jql:
+            messagebox.showwarning("Empty query", "Please enter a JQL query.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(jql)
+        self.jira_status_label.configure(text="Query copied to clipboard", foreground="gray")
+
+    def _fetch_jira_issues(self, jql: str):
+        """Fetch issues from JIRA and display in table."""
+        if not HAS_REQUESTS:
+            messagebox.showerror("Missing dependency",
+                                 "Run: pip install requests")
+            return
+        
+        self.jira_status_label.configure(text="Fetching …", foreground="gray")
+        self.jira_count_var.set("")
+        self._clear_jira_table()
+        self.jira_progress.start(10)
+        self.jira_frame.update()
+        
+        def worker():
+            try:
+                token_file = Path(__file__).with_name("jira_token")
+                try:
+                    token = token_file.read_text(encoding="utf-8").strip()
+                except OSError:
+                    token = os.getenv("JIRA_TOKEN", "")
+                
+                if not token:
+                    def show_error():
+                        self.jira_status_label.configure(text="Error: No JIRA token found",
+                                                         foreground="red")
+                        self.jira_count_var.set("—")
+                    self.after(0, show_error)
+                    return
+                
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                }
+                
+                base_url = os.getenv("JIRA_BASE_URL", "https://jira.devtools.intel.com")
+                url = f"{base_url.rstrip('/')}/rest/api/2/search"
+                
+                # Fetch all issues that match the query
+                all_issues = []
+                start_at = 0
+                max_results = 100
+                
+                while True:
+                    params = {
+                        "jql": jql,
+                        "startAt": start_at,
+                        "maxResults": max_results,
+                        "fields": "key,summary,status,priority,assignee",
+                    }
+                    
+                    resp = requests.get(url, headers=headers, params=params,
+                                       timeout=60, verify=False)
+                    resp.raise_for_status()
+                    
+                    data = resp.json()
+                    issues = data.get("issues", [])
+                    all_issues.extend(issues)
+                    
+                    total = data.get("total", 0)
+                    if start_at + max_results >= total:
+                        break
+                    
+                    start_at += max_results
+                
+                def populate():
+                    self.jira_progress.stop()
+                    self._populate_jira_table(all_issues)
+                    self.jira_count_var.set(f"Total: {len(all_issues)} issues")
+                    self.jira_status_label.configure(text="Done", foreground="gray")
+                
+                self.after(0, populate)
+                
+            except requests.exceptions.ConnectionError as exc:
+                def show_conn_error():
+                    self.jira_progress.stop()
+                    self.jira_status_label.configure(
+                        text="Error: Connection failed (check VPN)", foreground="red")
+                    self.jira_count_var.set("—")
+                self.after(0, show_conn_error)
+                
+            except requests.exceptions.HTTPError as exc:
+                def show_http_error():
+                    self.jira_progress.stop()
+                    self.jira_status_label.configure(
+                        text=f"Error: HTTP {exc.response.status_code}", foreground="red")
+                    self.jira_count_var.set("—")
+                self.after(0, show_http_error)
+                
+            except Exception as exc:
+                import traceback
+                def show_generic_error():
+                    self.jira_progress.stop()
+                    self.jira_status_label.configure(
+                        text=f"Error: {type(exc).__name__}: {str(exc)[:50]}", foreground="red")
+                    self.jira_count_var.set("—")
+                self.after(0, show_generic_error)
+                print(f"JIRA fetch error: {traceback.format_exc()}", file=sys.stderr)
+        
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _clear_jira_table(self):
+        """Clear JIRA results table."""
+        for item in self.jira_tree.get_children():
+            self.jira_tree.delete(item)
+
+    def _populate_jira_table(self, issues: list):
+        """Populate JIRA table with fetched issues."""
+        self._clear_jira_table()
+        
+        for issue in issues:
+            fields = issue.get("fields", {})
+            key = issue.get("key", "")
+            summary = fields.get("summary", "")
+            status = fields.get("status", {})
+            status_name = status.get("name", "") if isinstance(status, dict) else str(status)
+            priority = fields.get("priority", {})
+            priority_name = priority.get("name", "—") if isinstance(priority, dict) else str(priority)
+            assignee = fields.get("assignee")
+            assignee_name = assignee.get("displayName", "Unassigned") if assignee else "Unassigned"
+            
+            self.jira_tree.insert("", "end", 
+                                 values=(key, summary, status_name, priority_name, assignee_name))
+
+    def _sort_jira_column(self, col: str):
+        """Sort JIRA table by column."""
+        rev = self._jira_sort_reverse.get(col, False)
+        data = [(self.jira_tree.set(k, col), k) for k in self.jira_tree.get_children("")]
+        data.sort(key=lambda x: x[0].lower(), reverse=rev)
+        for idx, (_, k) in enumerate(data):
+            self.jira_tree.move(k, "", idx)
+        self._jira_sort_reverse[col] = not rev
+
+    def _open_jira_search(self, jql: str):
+        """Open JIRA search in browser."""
+        base_url = os.getenv("JIRA_BASE_URL", "https://jira.devtools.intel.com")
+        url = f"{base_url.rstrip('/')}/issues/?jql={urllib.parse.quote(jql)}"
+        webbrowser.open(url)
+
+    def _copy_jira_query(self, jql: str):
+        """Copy query to clipboard."""
+        self.clipboard_clear()
+        self.clipboard_append(jql)
+        self.jira_status_label.configure(text="Query copied to clipboard", foreground="gray")
+
+    # ---------------------------------------------------------- helpers ------
+
+    def _combo(self, parent, values, default, row, col, width=22):
+        cb = ttk.Combobox(parent, values=values, width=width, state="readonly")
+        cb.set(default)
+        cb.grid(row=row, column=col, padx=8, pady=3, sticky="w")
+        return cb
+
+    def _op(self, combo_value: str) -> str:
+        """Convert display value like '~= (regex/contains)' → '~='"""
+        return combo_value.split()[0]
+
+    def _check_deps(self):
+        if not HAS_REQUESTS:
+            messagebox.showwarning(
+                "Missing dependency",
+                "Module 'requests' is not installed.\n\n"
+                "Run in your terminal:\n\n"
+                "  pip install requests beautifulsoup4\n\n"
+                "The application requires this to fetch data."
+            )
+        elif not HAS_BS4:
+            self._set_status(
+                "Tip: install beautifulsoup4 for best results  (pip install beautifulsoup4)",
+                warn=True
+            )
+
+    # ----------------------------------------------------- query building ---
+
+    def _build_query(self) -> str:
+        parts = []
+
+        tv = self.test_value.get().strip()
+        if tv:
+            parts.append(f"test_name{self._op(self.test_match.get())}'{tv}'")
+
+        mv = self.machine_value.get().strip()
+        if mv:
+            conn = self.machine_conn.get()
+            expr = f"machine_name{self._op(self.machine_match.get())}'{mv}'"
+            parts.append(f"{conn} {expr}" if parts else
+                         (f"NOT {expr}" if "NOT" in conn else expr))
+
+        rv = self.rc_value.get().strip()
+        if rv:
+            conn = self.rc_conn.get()
+            expr = f"runconfig_name{self._op(self.rc_match.get())}'{rv}'"
+            parts.append(f"{conn} {expr}" if parts else
+                         (f"NOT {expr}" if "NOT" in conn else expr))
+
+        dv = self.date_value.get().strip()
+        if dv:
+            expr = f"runconfig_added_on > datetime({dv})"
+            parts.append(f"AND {expr}" if parts else expr)
+
+        return " ".join(parts)
+
+    def _update_preview(self, _=None):
+        # Only overwrite when the entry is not being manually edited
+        self.query_var.set(self._build_query())
+
+    def _on_query_edit(self, _=None):
+        """User typed manually in the preview box — don't auto-parse."""
+        pass
+
+    def _on_query_paste(self, _=None):
+        """After paste: parse only when all filter fields are empty."""
+        all_empty = not any([
+            self.test_value.get().strip(),
+            self.machine_value.get().strip(),
+            self.rc_value.get().strip(),
+            self.date_value.get().strip(),
+        ])
+        if all_empty:
+            self.after(10, self._parse_query_to_fields)
+
+    def _parse_query_to_fields(self):
+        """Parse the raw query string back into the individual filter fields."""
+        raw = self.query_var.get().strip()
+        if not raw:
+            return
+
+        # test_name
+        tm = re.search(r"test_name\s*(~?=)\s*'([^']*)'", raw, re.IGNORECASE)
+        if tm:
+            self.test_match.set(
+                "~= (regex/contains)" if "~" in tm.group(1) else "= (exact)")
+            self.test_value.delete(0, "end")
+            self.test_value.insert(0, tm.group(2))
+
+        # machine_name
+        mm = re.search(
+            r"(AND\s+NOT|AND)\s+machine_name\s*(~?=)\s*'([^']*)'|"
+            r"^machine_name\s*(~?=)\s*'([^']*)'",
+            raw, re.IGNORECASE)
+        if mm:
+            if mm.group(1):                           # matched with connector
+                conn = "AND NOT" if "NOT" in mm.group(1).upper() else "AND"
+                op   = mm.group(2)
+                val  = mm.group(3)
+            else:                                     # first token, no connector
+                conn = "AND"
+                op   = mm.group(4)
+                val  = mm.group(5)
+            self.machine_conn.set(conn)
+            self.machine_match.set(
+                "~= (regex/contains)" if op and "~" in op else "= (exact)")
+            self.machine_value.delete(0, "end")
+            self.machine_value.insert(0, val)
+
+        # runconfig_name
+        rm = re.search(
+            r"(AND\s+NOT|AND)\s+runconfig_name\s*(~?=)\s*'([^']*)'|"
+            r"^runconfig_name\s*(~?=)\s*'([^']*)'",
+            raw, re.IGNORECASE)
+        if rm:
+            if rm.group(1):
+                conn = "AND NOT" if "NOT" in rm.group(1).upper() else "AND"
+                op   = rm.group(2)
+                val  = rm.group(3)
+            else:
+                conn = "AND"
+                op   = rm.group(4)
+                val  = rm.group(5)
+            self.rc_conn.set(conn)
+            self.rc_match.set(
+                "~= (regex/contains)" if op and "~" in op else "= (exact)")
+            self.rc_value.delete(0, "end")
+            self.rc_value.insert(0, val)
+
+        # date
+        dm = re.search(r"runconfig_added_on\s*>\s*datetime\(([^)]+)\)", raw, re.IGNORECASE)
+        self.date_value.delete(0, "end")
+        if dm:
+            self.date_value.insert(0, dm.group(1).strip())
+
+        # Rebuild preview from parsed fields to normalise it
+        self._update_preview()
+        self._set_status("Query parsed into fields.")
+
+    def _copy_query(self):
+        self.clipboard_clear()
+        self.clipboard_append(self._build_query())
+        self._set_status("Query copied to clipboard.")
+
+    def _open_browser(self):
+        q = self._build_query()
+        if q:
+            webbrowser.open(CIBUGLOG_BASE + "?query=" + urllib.parse.quote(q))
+
+    def _clear_all(self):
+        for w in (self.test_value, self.machine_value, self.rc_value, self.date_value):
+            w.delete(0, "end")
+        self.test_match.set("= (exact)")
+        self.machine_conn.set("AND")
+        self.machine_match.set("~= (regex/contains)")
+        self.rc_conn.set("AND NOT")
+        self.rc_match.set("~= (regex/contains)")
+        self._update_preview()
+        self._clear_table()
+        self.count_var.set("")
+        self._set_status("Ready")
+
+    def _clear_table(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self._item_urls = {}
+
+    # -------------------------------------------------------- fetch / parse --
+
+    def _load_history(self):
+        try:
+            with open(HISTORY_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            self._query_history[:] = data.get("queries", [])[:20]
+            for key in ("test", "machine", "runconfig", "date"):
+                self._field_history[key] = data.get(key, [])[:20]
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            pass
+        self.test_value.configure(values=self._field_history["test"])
+        self.machine_value.configure(values=self._field_history["machine"])
+        self.rc_value.configure(values=self._field_history["runconfig"])
+        self.date_value.configure(values=self._field_history["date"])
+
+    def _save_history(self):
+        try:
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump({
+                    "queries":   self._query_history,
+                    "test":      self._field_history["test"],
+                    "machine":   self._field_history["machine"],
+                    "runconfig": self._field_history["runconfig"],
+                    "date":      self._field_history["date"],
+                }, f, indent=2, ensure_ascii=False)
+        except OSError:
+            pass
+
+    def _add_to_history(self, query: str):
+        def _push(lst, val):
+            if val in lst:
+                lst.remove(val)
+            lst.insert(0, val)
+            del lst[20:]
+
+        _push(self._query_history, query)
+        for key, widget in (
+            ("test",      self.test_value),
+            ("machine",   self.machine_value),
+            ("runconfig", self.rc_value),
+            ("date",      self.date_value),
+        ):
+            val = widget.get().strip()
+            if val:
+                _push(self._field_history[key], val)
+                widget.configure(values=self._field_history[key])
+        self._save_history()
+
+    def _refresh_history_dropdown(self):
+        self.query_entry.configure(values=self._query_history)
+
+    def _on_history_select(self, _event=None):
+        self._parse_query_to_fields()
+
+    def _fetch_async(self):
+        if not HAS_REQUESTS:
+            messagebox.showerror("Missing dependency",
+                                 "Run: pip install requests beautifulsoup4")
+            return
+        q = self._build_query()
+        if not q:
+            messagebox.showwarning("Empty query",
+                                   "Please fill in at least one filter field.")
+            return
+        self._update_preview()
+        self._add_to_history(q)
+        self._clear_table()
+        self.count_var.set("")
+        self._set_status("Fetching …")
+        self.progress.start(10)
+        threading.Thread(target=self._worker, args=(q,), daemon=True).start()
+
+    def _worker(self, query: str):
+        import traceback
+        try:
+            url = CIBUGLOG_BASE + "?" + urllib.parse.urlencode(
+                {"query": query, "page": 1, "page_size": PAGE_SIZE}
+            )
+            auth = HttpNegotiateAuth() if HAS_SSPI else None
+
+            # --- first attempt (with or without proxy as chosen) ---
+            proxies = PROXIES if self.use_proxy_var.get() else None
+            kwargs  = dict(timeout=30, proxies=proxies, verify=False, auth=auth)
+            resp = requests.get(url, **kwargs)
+
+            # --- if 403/401, retry with the opposite proxy setting ---
+            if resp.status_code in (401, 403):
+                alt_proxies = None if proxies else PROXIES
+                resp2 = requests.get(url, timeout=30, proxies=alt_proxies,
+                                     verify=False, auth=auth)
+                if resp2.status_code == 200:
+                    # update checkbox to reflect what worked
+                    self.after(0, self.use_proxy_var.set, alt_proxies is not None)
+                    resp = resp2
+
+            resp.raise_for_status()
+            count, rows, url_lists = self._parse(resp.text)
+            self.after(0, self._populate, count, rows, url_lists)
+        except requests.exceptions.ConnectionError as exc:
+            self.after(0, self._on_error,
+                       f"Connection failed.\n{exc}\n\n"
+                       "Make sure you are connected to the Intel network (VPN).")
+        except requests.exceptions.Timeout:
+            self.after(0, self._on_error, "Request timed out (30 s).")
+        except requests.exceptions.HTTPError as exc:
+            self.after(0, self._on_error,
+                       f"HTTP {exc.response.status_code} - {exc.response.reason}\n"
+                       f"URL: {exc.response.url}\n\n"
+                       f"Try toggling the 'Use proxy' checkbox and retry.")
+        except Exception as exc:
+            self.after(0, self._on_error,
+                       f"Unexpected error:\n{type(exc).__name__}: {exc}\n\n"
+                       f"{traceback.format_exc()}")
+
+    def _parse(self, html: str):
+        count = 0
+        m = re.search(r"Results list\s*\(\s*(\d+)\s*\)", html)
+        if m:
+            count = int(m.group(1))
+
+        rows = []
+        url_lists = []   # parallel list: URLs extracted from issue cell per row
+        if HAS_BS4:
+            soup = BeautifulSoup(html, "html.parser")
+            for table in soup.find_all("table"):
+                for tr in table.find_all("tr"):
+                    tds = tr.find_all("td")
+                    if len(tds) >= 5:
+                        row = [re.sub(r"\s+", " ", td.get_text(" ", strip=True))
+                               for td in tds[:7]]
+                        while len(row) < 7:
+                            row.append("")
+                        rows.append(row)
+                        # collect hrefs from the issue cell (last one, index 6)
+                        issue_td = tds[6] if len(tds) > 6 else tds[-1]
+                        urls = [a["href"] for a in issue_td.find_all("a", href=True)]
+                        url_lists.append(urls)
+        else:
+            # Regex fallback
+            for tr_m in re.finditer(r"<tr[^>]*>(.*?)</tr>", html, re.S | re.I):
+                cells_raw = list(re.finditer(
+                    r"<td[^>]*>(.*?)</td>", tr_m.group(1), re.S | re.I))
+                if len(cells_raw) < 5:
+                    continue
+                cells = [
+                    re.sub(r"\s+", " ",
+                           re.sub(r"<[^>]+>", " ", c.group(1))).strip()
+                    for c in cells_raw
+                ]
+                while len(cells) < 7:
+                    cells.append("")
+                rows.append(cells[:7])
+                # extract hrefs from raw issue cell html
+                issue_raw = cells_raw[6].group(1) if len(cells_raw) > 6 else ""
+                urls = re.findall(r'href=["\']([^"\'>]+)["\']', issue_raw, re.I)
+                url_lists.append(urls)
+
+        return count, rows, url_lists
+
+    def _populate(self, count: int, rows: list, url_lists: list | None = None):
+        self.progress.stop()
+        self._clear_table()
+        self._item_urls: dict[str, list[str]] = {}
+
+        if not rows:
+            self._set_status("No results found." if count == 0 else
+                             f"{count} results, but table could not be parsed.")
+            self.count_var.set(f"Total: {count}  |  Loaded: 0")
+            return
+
+        self.count_var.set(
+            f"Total: {count}  |  Showing: {len(rows)}  "
+            f"(page 1, max {PAGE_SIZE} per page)"
+        )
+        self._set_status(f"Done — {len(rows)} rows loaded.")
+
+        for i, row in enumerate(rows):
+            status_raw = row[3] if len(row) > 3 else ""
+            tag = classify_status(status_raw)
+
+            display = [clean_cell(c) for c in row[:7]]
+            while len(display) < 7:
+                display.append("")
+
+            iid = self.tree.insert("", "end", values=display,
+                                   tags=(tag,) if tag else ())
+            if url_lists and i < len(url_lists):
+                self._item_urls[iid] = url_lists[i]
+
+    def _on_error(self, msg: str):
+        self.progress.stop()
+        self._set_status(f"Error: {msg.splitlines()[0]}", error=True)
+        # Selectable error dialog (so user can copy the text)
+        dlg = tk.Toplevel(self)
+        dlg.title("Fetch Error")
+        dlg.resizable(True, True)
+        dlg.grab_set()
+        txt = tk.Text(dlg, wrap="word", font=("Consolas", 9),
+                      width=80, height=18, relief="flat",
+                      background="#fff0f0", foreground="#721c24")
+        txt.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        txt.insert("1.0", msg)
+        txt.configure(state="disabled")
+        sb = ttk.Scrollbar(dlg, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        ttk.Button(dlg, text="Close", command=dlg.destroy).pack(pady=(4, 10))
+        dlg.bind("<Escape>", lambda _: dlg.destroy())
+
+    # ---------------------------------------------------------- table utils --
+
+    def _sort_column(self, col: str):
+        rev = self._sort_reverse.get(col, False)
+        data = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
+        data.sort(key=lambda x: x[0].lower(), reverse=rev)
+        for idx, (_, k) in enumerate(data):
+            self.tree.move(k, "", idx)
+        self._sort_reverse[col] = not rev
+        arrow = " ↑" if rev else " ↓"
+        col_cfg = {
+            "test": "Test Name", "runconfig": "Runconfig", "tags": "Tags",
+            "status": "Status", "duration": "Duration",
+            "build": "Build", "issue": "Issue",
+        }
+        for c, lbl in col_cfg.items():
+            self.tree.heading(c, text=lbl + (arrow if c == col else ""))
+
+    def _show_ctx(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        self.tree.selection_set(item)
+        col_id = self.tree.identify_column(event.x)
+        self._ctx_col = int(col_id.lstrip("#")) - 1 if col_id else None
+
+        # Rebuild menu each time
+        self._ctx.delete(0, "end")
+        self._ctx.add_command(label="Copy value", command=self._copy_value)
+        self._ctx.add_command(label="Copy row",   command=self._copy_row)
+
+        # Collect URLs for this row
+        raw_urls = getattr(self, "_item_urls", {}).get(item, [])
+        jira_base     = "https://jira.devtools.intel.com"
+        cibuglog_base = "https://gfx-ci-internal.igk.intel.com"
+        urls = []
+        for u in raw_urls:
+            u = u.strip()
+            if not u or u.startswith("#"):
+                continue
+            if u.startswith("http"):
+                urls.append(u)
+            elif u.startswith("/browse/"):
+                urls.append(jira_base + u)
+            elif u.startswith("/"):
+                urls.append(cibuglog_base + u)
+        seen = set()
+        urls = [u for u in urls if not (u in seen or seen.add(u))]
+
+        # Search for Jira ticket IDs in ALL columns of the row
+        all_values = self.tree.item(item, "values") or []
+        combined = " ".join(str(v) for v in all_values) + " " + " ".join(urls)
+        jira_tickets = re.findall(r"(?<![A-Z])([A-Z]{2,}-\d+)", combined)
+        for ticket in dict.fromkeys(jira_tickets):   # deduplicate, preserve order
+            jira_url = f"{jira_base}/browse/{ticket}"
+            if jira_url not in urls:
+                urls.append(jira_url)
+
+        if urls:
+            self._ctx.add_separator()
+            for u in urls:
+                if "jira" in u or "/browse/" in u:
+                    label = "Open Jira: " + u.split("/")[-1]
+                else:
+                    label = "Open URL: " + u
+                self._ctx.add_command(label=label,
+                                      command=lambda x=u: webbrowser.open(x))
+
+        self._ctx.tk_popup(event.x_root, event.y_root)
+
+    def _copy_value(self):
+        sel = self.tree.selection()
+        if sel and self._ctx_col is not None:
+            vals = self.tree.item(sel[0], "values")
+            if 0 <= self._ctx_col < len(vals):
+                self.clipboard_clear()
+                self.clipboard_append(vals[self._ctx_col])
+
+    def _copy_row(self):
+        sel = self.tree.selection()
+        if sel:
+            vals = self.tree.item(sel[0], "values")
+            self.clipboard_clear()
+            self.clipboard_append("\t".join(vals))
+
+    def _open_issue(self):
+        pass  # handled dynamically via context menu
+
+
+    def _export_csv(self):
+        rows = [self.tree.item(child, "values")
+                for child in self.tree.get_children()]
+        if not rows:
+            messagebox.showinfo("Export", "No data to export.")
+            return
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["Test Name", "Runconfig", "Tags",
+                         "Status", "Duration", "Build", "Issue"])
+        writer.writerows(rows)
+        self.clipboard_clear()
+        self.clipboard_append(buf.getvalue())
+        self._set_status(f"CSV ({len(rows)} rows) copied to clipboard — paste into Excel or a file.")
+
+    # ---------------------------------------------------------------- misc --
+
+    def _set_status(self, msg: str, error: bool = False, warn: bool = False):
+        self.status_var.set(msg)
+        color = "red" if error else ("#b8860b" if warn else "gray")
+        self.status_lbl.configure(foreground=color)
+
+
+if __name__ == "__main__":
+    app = CIBugLogApp()
+    app.mainloop()
