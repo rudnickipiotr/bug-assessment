@@ -44,7 +44,10 @@ try:
 except ImportError:
     HAS_BS4 = False
 
-CIBUGLOG_BASE = "https://gfx-ci-internal.igk.intel.com/cibuglog/results/all"
+CIBUGLOG_ROOT_OPTIONS = [
+    "https://gfx-ci.igk.intel.com/cibuglog-ng/",
+    "https://gfx-ci-internal.igk.intel.com/cibuglog",
+]
 PAGE_SIZE = 100
 PROXIES = {
     "http":  "http://proxy-dmz.intel.com:912",
@@ -106,7 +109,12 @@ def _looks_like_tree_url(url: str) -> bool:
     return bool(re.search(r"(^|/)tree(?:[/?#]|$)", url or "", re.I))
 
 
-def _build_tree_url_from_row(test_name: str, machine_name: str, build_text: str) -> str:
+def _build_tree_url_from_row(
+    test_name: str,
+    machine_name: str,
+    build_text: str,
+    cibuglog_origin: str,
+) -> str:
     test = (test_name or "").strip()
     machine = (machine_name or "").strip()
     build = (build_text or "").strip()
@@ -121,7 +129,7 @@ def _build_tree_url_from_row(test_name: str, machine_name: str, build_text: str)
     test_part = urllib.parse.quote(test, safe="@._-+")
     machine_part = urllib.parse.quote(machine, safe="@._-+")
     return (
-        f"https://gfx-ci-internal.igk.intel.com/tree/xe/{build_id}/"
+        f"{cibuglog_origin.rstrip('/')}/tree/xe/{build_id}/"
         f"{machine_part}/{test_part}.html"
     )
 
@@ -249,6 +257,18 @@ class CIBugLogApp(tk.Tk):
         ttk.Button(bframe, text="Clear All",
                    command=self._clear_all).pack(side="left", padx=4)
 
+        ttk.Label(bframe, text="CIBugLog:").pack(side="left", padx=(16, 4))
+        self.cibuglog_root_var = tk.StringVar(value=CIBUGLOG_ROOT_OPTIONS[1])
+        self.cibuglog_root_cb = ttk.Combobox(
+            bframe,
+            textvariable=self.cibuglog_root_var,
+            values=CIBUGLOG_ROOT_OPTIONS,
+            state="readonly",
+            width=50,
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.cibuglog_root_cb.pack(side="left", padx=(0, 8))
+
         self.use_proxy_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(bframe, text="Use proxy",
                         variable=self.use_proxy_var).pack(side="left", padx=8)
@@ -271,17 +291,16 @@ class CIBugLogApp(tk.Tk):
         tframe.rowconfigure(0, weight=1)
         tframe.columnconfigure(0, weight=1)
 
-        cols = ("test", "runconfig", "tags", "status", "duration", "build", "issue")
+        cols = ("test", "runconfig", "tags", "status", "build", "issue")
         self.tree = ttk.Treeview(tframe, columns=cols, show="headings", selectmode="extended")
 
         col_cfg = [
-            ("test",      "Test Name",  340),
-            ("runconfig", "Runconfig",  220),
-            ("tags",      "Tags",       160),
-            ("status",    "Status",     110),
-            ("duration",  "Duration",    90),
-            ("build",     "Build",      220),
-            ("issue",     "Issue",      320),
+            ("test",      "Test Name",   340),
+            ("runconfig", "Machine",     220),
+            ("tags",      "Tags",        160),
+            ("status",    "Status",      110),
+            ("build",     "Run Config",  220),
+            ("issue",     "Issue",       320),
         ]
         for cid, heading, width in col_cfg:
             self.tree.heading(cid, text=heading,
@@ -864,7 +883,7 @@ class CIBugLogApp(tk.Tk):
     def _open_browser(self):
         q = self._build_query()
         if q:
-            webbrowser.open(CIBUGLOG_BASE + "?query=" + urllib.parse.quote(q))
+            webbrowser.open(self._get_cibuglog_results_base() + "?query=" + urllib.parse.quote(q))
 
     def _clear_all(self):
         for w in (self.test_value, self.machine_value, self.rc_value, self.date_value):
@@ -894,6 +913,9 @@ class CIBugLogApp(tk.Tk):
             self._query_history[:] = data.get("queries", [])[:20]
             for key in ("test", "machine", "runconfig", "date"):
                 self._field_history[key] = data.get(key, [])[:20]
+            saved_root = data.get("cibuglog_root", "")
+            if saved_root in CIBUGLOG_ROOT_OPTIONS:
+                self.cibuglog_root_var.set(saved_root)
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
             pass
         self.test_value.configure(values=self._field_history["test"])
@@ -905,11 +927,12 @@ class CIBugLogApp(tk.Tk):
         try:
             with open(HISTORY_FILE, "w", encoding="utf-8") as f:
                 json.dump({
-                    "queries":   self._query_history,
-                    "test":      self._field_history["test"],
-                    "machine":   self._field_history["machine"],
-                    "runconfig": self._field_history["runconfig"],
-                    "date":      self._field_history["date"],
+                    "queries":      self._query_history,
+                    "test":         self._field_history["test"],
+                    "machine":      self._field_history["machine"],
+                    "runconfig":    self._field_history["runconfig"],
+                    "date":         self._field_history["date"],
+                    "cibuglog_root": self.cibuglog_root_var.get(),
                 }, f, indent=2, ensure_ascii=False)
         except OSError:
             pass
@@ -961,7 +984,7 @@ class CIBugLogApp(tk.Tk):
     def _worker(self, query: str):
         import traceback
         try:
-            url = CIBUGLOG_BASE + "?" + urllib.parse.urlencode(
+            url = self._get_cibuglog_results_base() + "?" + urllib.parse.urlencode(
                 {"query": query, "page": 1, "page_size": PAGE_SIZE}
             )
             auth = HttpNegotiateAuth() if HAS_SSPI else None
@@ -1138,14 +1161,25 @@ class CIBugLogApp(tk.Tk):
             while len(display) < 7:
                 display.append("")
 
-            iid = self.tree.insert("", "end", values=display,
+            # build tree URL before removing duration (display[5] = build/runconfig)
+            if _is_external_link_marker(status_raw):
+                tree_url = _build_tree_url_from_row(
+                    display[0],
+                    display[1],
+                    display[5],
+                    self._get_cibuglog_origin(),
+                )
+
+            # drop duration (index 4) — not shown in table
+            display_row = display[:4] + display[5:]
+
+            iid = self.tree.insert("", "end", values=display_row,
                                    tags=(tag,) if tag else ())
             if url_lists and i < len(url_lists):
                 self._item_urls[iid] = url_lists[i]
 
             # Prefer deterministic /tree URL for rows marked as external URL.
             if _is_external_link_marker(status_raw):
-                tree_url = _build_tree_url_from_row(display[0], display[1], display[5])
                 if tree_url:
                     self._item_external_url[iid] = tree_url
 
@@ -1188,9 +1222,9 @@ class CIBugLogApp(tk.Tk):
         self._sort_reverse[col] = not rev
         arrow = " ↑" if rev else " ↓"
         col_cfg = {
-            "test": "Test Name", "runconfig": "Runconfig", "tags": "Tags",
-            "status": "Status", "duration": "Duration",
-            "build": "Build", "issue": "Issue",
+            "test": "Test Name", "runconfig": "Machine", "tags": "Tags",
+            "status": "Status",
+            "build": "Run Config", "issue": "Issue",
         }
         for c, lbl in col_cfg.items():
             self.tree.heading(c, text=lbl + (arrow if c == col else ""))
@@ -1209,7 +1243,7 @@ class CIBugLogApp(tk.Tk):
         self._ctx.add_command(label="Copy row",   command=self._copy_row)
 
         jira_base = "https://jira.devtools.intel.com"
-        cibuglog_base = "https://gfx-ci-internal.igk.intel.com"
+        cibuglog_base = self._get_cibuglog_origin()
         ext_raw = getattr(self, "_item_external_url", {}).get(item, "").strip()
 
         # Strong fallback: infer external link from all row URLs.
@@ -1305,6 +1339,16 @@ class CIBugLogApp(tk.Tk):
     def _open_issue(self):
         pass  # handled dynamically via context menu
 
+    def _get_cibuglog_root(self) -> str:
+        return (self.cibuglog_root_var.get() or CIBUGLOG_ROOT_OPTIONS[1]).rstrip("/")
+
+    def _get_cibuglog_results_base(self) -> str:
+        return self._get_cibuglog_root() + "/results/all"
+
+    def _get_cibuglog_origin(self) -> str:
+        root = self._get_cibuglog_root()
+        parts = urllib.parse.urlsplit(root)
+        return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else root
 
     def _export_csv(self):
         rows = [self.tree.item(child, "values")
@@ -1314,8 +1358,8 @@ class CIBugLogApp(tk.Tk):
             return
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(["Test Name", "Runconfig", "Tags",
-                         "Status", "Duration", "Build", "Issue"])
+        writer.writerow(["Test Name", "Machine", "Tags",
+                         "Status", "Run Config", "Issue"])
         writer.writerows(rows)
         self.clipboard_clear()
         self.clipboard_append(buf.getvalue())
