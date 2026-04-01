@@ -10,6 +10,7 @@ Requirements:
 
 import tkinter as tk
 from tkinter import ttk, messagebox
+import tkinter.font as tkfont
 import threading
 import urllib.parse
 import re
@@ -19,6 +20,7 @@ import io
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 try:
@@ -313,12 +315,13 @@ class CIBugLogApp(tk.Tk):
         tframe.rowconfigure(0, weight=1)
         tframe.columnconfigure(0, weight=1)
         
-        cols = ("key", "summary", "status", "priority", "assignee")
+        cols = ("key", "created", "summary", "status", "priority", "assignee")
         self.jira_tree = ttk.Treeview(tframe, columns=cols, show="headings", selectmode="extended")
         
         col_cfg = [
             ("key",      "Key",       100),
-            ("summary",  "Summary",   500),
+            ("created",  "Created",   135),
+            ("summary",  "Summary",   420),
             ("status",   "Status",    100),
             ("priority", "Priority",  80),
             ("assignee", "Assignee",  150),
@@ -326,7 +329,12 @@ class CIBugLogApp(tk.Tk):
         for cid, heading, width in col_cfg:
             self.jira_tree.heading(cid, text=heading,
                                    command=lambda c=cid: self._sort_jira_column(c))
-            self.jira_tree.column(cid, width=width, minwidth=60, stretch=True)
+            self.jira_tree.column(
+                cid,
+                width=width,
+                minwidth=60,
+                stretch=(cid == "summary"),
+            )
         
         vsb = ttk.Scrollbar(tframe, orient="vertical",   command=self.jira_tree.yview)
         hsb = ttk.Scrollbar(tframe, orient="horizontal", command=self.jira_tree.xview)
@@ -335,6 +343,13 @@ class CIBugLogApp(tk.Tk):
         self.jira_tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
+
+        # Context menu for JIRA rows
+        self._jira_ctx = tk.Menu(self, tearoff=0)
+        self._jira_ctx_col = None
+        self.jira_tree.bind("<Button-3>", self._show_jira_ctx)
+        self.jira_tree.bind("<ButtonRelease-3>", self._show_jira_ctx)
+        self.jira_tree.bind("<Control-Button-1>", self._show_jira_ctx)
         
         # Store sort state for JIRA table
         self._jira_sort_reverse = {}
@@ -416,7 +431,7 @@ class CIBugLogApp(tk.Tk):
                         "jql": jql,
                         "startAt": start_at,
                         "maxResults": max_results,
-                        "fields": "key,summary,status,priority,assignee",
+                        "fields": "key,created,summary,status,priority,assignee",
                     }
                     
                     resp = requests.get(url, headers=headers, params=params,
@@ -481,6 +496,7 @@ class CIBugLogApp(tk.Tk):
         for issue in issues:
             fields = issue.get("fields", {})
             key = issue.get("key", "")
+            created = self._format_jira_created(fields.get("created", ""))
             summary = fields.get("summary", "")
             status = fields.get("status", {})
             status_name = status.get("name", "") if isinstance(status, dict) else str(status)
@@ -490,7 +506,58 @@ class CIBugLogApp(tk.Tk):
             assignee_name = assignee.get("displayName", "Unassigned") if assignee else "Unassigned"
             
             self.jira_tree.insert("", "end", 
-                                 values=(key, summary, status_name, priority_name, assignee_name))
+                                 values=(key, created, summary, status_name, priority_name, assignee_name))
+
+        self._autofit_jira_columns()
+
+    def _autofit_jira_columns(self):
+        """Auto-fit JIRA columns to content and keep Summary visibly widest."""
+        cols = ("key", "created", "summary", "status", "priority", "assignee")
+        cell_font = tkfont.nametofont("TkDefaultFont")
+
+        widths: dict[str, int] = {}
+        for col in cols:
+            heading_text = self.jira_tree.heading(col, "text") or col
+            max_px = cell_font.measure(str(heading_text)) + 26
+            for item in self.jira_tree.get_children(""):
+                value = self.jira_tree.set(item, col)
+                max_px = max(max_px, cell_font.measure(str(value)) + 20)
+            widths[col] = max_px
+
+        # Clamp compact columns; Summary stays larger and can expand.
+        caps = {
+            "key": (90, 180),
+            "created": (120, 190),
+            "status": (90, 170),
+            "priority": (80, 140),
+            "assignee": (120, 260),
+        }
+        for col, (min_w, max_w) in caps.items():
+            widths[col] = max(min_w, min(max_w, widths[col]))
+
+        widest_other = max(widths[c] for c in widths if c != "summary")
+        summary_target = max(widths["summary"], int(widest_other * 1.8), 420)
+        widths["summary"] = min(summary_target, 1200)
+
+        for col in cols:
+            self.jira_tree.column(
+                col,
+                width=widths[col],
+                minwidth=80 if col == "summary" else 60,
+                stretch=(col == "summary"),
+            )
+
+    def _format_jira_created(self, created_raw: str) -> str:
+        """Format JIRA created timestamp to a readable local string."""
+        if not created_raw:
+            return ""
+        try:
+            # Example: 2026-03-31T09:47:12.123+0000
+            dt = datetime.strptime(created_raw, "%Y-%m-%dT%H:%M:%S.%f%z")
+            return dt.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            # Fallback for unexpected formats.
+            return str(created_raw).replace("T", " ")[:16]
 
     def _sort_jira_column(self, col: str):
         """Sort JIRA table by column."""
@@ -512,6 +579,59 @@ class CIBugLogApp(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(jql)
         self.jira_status_label.configure(text="Query copied to clipboard", foreground="gray")
+
+    def _show_jira_ctx(self, event):
+        """Show context menu for a row in the JIRA table."""
+        item = self.jira_tree.identify_row(event.y)
+        if not item:
+            return
+
+        self.jira_tree.selection_set(item)
+        col_id = self.jira_tree.identify_column(event.x)
+        self._jira_ctx_col = int(col_id.lstrip("#")) - 1 if col_id else None
+
+        self._jira_ctx.delete(0, "end")
+        self._jira_ctx.add_command(label="Open issue in JIRA",
+                                   command=self._open_selected_jira_issue)
+        self._jira_ctx.add_separator()
+        self._jira_ctx.add_command(label="Copy value", command=self._copy_jira_value)
+        self._jira_ctx.add_command(label="Copy row", command=self._copy_jira_row)
+        try:
+            self._jira_ctx.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._jira_ctx.grab_release()
+
+    def _open_selected_jira_issue(self):
+        """Open selected JIRA issue key from the table row in browser."""
+        sel = self.jira_tree.selection()
+        if not sel:
+            return
+
+        values = self.jira_tree.item(sel[0], "values") or ()
+        issue_key = str(values[0]).strip() if values else ""
+        if not issue_key:
+            messagebox.showwarning("No issue key", "Selected row has no issue key.")
+            return
+
+        base_url = os.getenv("JIRA_BASE_URL", "https://jira.devtools.intel.com")
+        webbrowser.open(f"{base_url.rstrip('/')}/browse/{issue_key}")
+
+    def _copy_jira_value(self):
+        """Copy selected JIRA table cell value to clipboard."""
+        sel = self.jira_tree.selection()
+        if sel and self._jira_ctx_col is not None:
+            vals = self.jira_tree.item(sel[0], "values")
+            if 0 <= self._jira_ctx_col < len(vals):
+                self.clipboard_clear()
+                self.clipboard_append(vals[self._jira_ctx_col])
+
+    def _copy_jira_row(self):
+        """Copy selected JIRA table row to clipboard."""
+        sel = self.jira_tree.selection()
+        if sel:
+            vals = self.jira_tree.item(sel[0], "values")
+            self.clipboard_clear()
+            self.clipboard_append("\t".join(vals))
 
     # ---------------------------------------------------------- helpers ------
 
