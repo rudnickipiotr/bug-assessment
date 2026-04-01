@@ -117,6 +117,7 @@ class CIBugLogApp(tk.Tk):
         self._build_cibuglog_ui()
         self._load_history()
         self._check_deps()
+        self.after(250, self._auto_fetch_jira_on_startup)
 
     # ------------------------------------------------------------------ UI --
 
@@ -303,6 +304,15 @@ class CIBugLogApp(tk.Tk):
         
         self.jira_progress = ttk.Progressbar(btn_frame, mode="indeterminate", length=180)
         self.jira_progress.pack(side="right", padx=6)
+
+        # ---- Inline filter (highlight matching rows) ----
+        filter_frame = ttk.Frame(self.jira_frame)
+        filter_frame.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Label(filter_frame, text="Filter:").pack(side="left")
+        self.jira_filter_var = tk.StringVar(value="eudebug")
+        self.jira_filter_entry = ttk.Entry(filter_frame, textvariable=self.jira_filter_var)
+        self.jira_filter_entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.jira_filter_entry.bind("<KeyRelease>", self._on_jira_filter_changed)
         
         # ---- Count label ----
         self.jira_count_var = tk.StringVar(value="")
@@ -315,13 +325,14 @@ class CIBugLogApp(tk.Tk):
         tframe.rowconfigure(0, weight=1)
         tframe.columnconfigure(0, weight=1)
         
-        cols = ("key", "created", "summary", "status", "priority", "assignee")
+        cols = ("key", "created", "summary", "labels", "status", "priority", "assignee")
         self.jira_tree = ttk.Treeview(tframe, columns=cols, show="headings", selectmode="extended")
         
         col_cfg = [
             ("key",      "Key",       100),
             ("created",  "Created",   135),
             ("summary",  "Summary",   420),
+            ("labels",   "Labels",    160),
             ("status",   "Status",    100),
             ("priority", "Priority",  80),
             ("assignee", "Assignee",  150),
@@ -343,6 +354,8 @@ class CIBugLogApp(tk.Tk):
         self.jira_tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
+
+        self.jira_tree.tag_configure("jira_filter_match", background="#fff59d")
 
         # Context menu for JIRA rows
         self._jira_ctx = tk.Menu(self, tearoff=0)
@@ -383,6 +396,14 @@ class CIBugLogApp(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(jql)
         self.jira_status_label.configure(text="Query copied to clipboard", foreground="gray")
+
+    def _auto_fetch_jira_on_startup(self):
+        """Fetch JIRA issues automatically once the app starts."""
+        if not HAS_REQUESTS:
+            return
+        jql = self._get_jira_query()
+        if jql:
+            self._fetch_jira_issues(jql)
 
     def _fetch_jira_issues(self, jql: str):
         """Fetch issues from JIRA and display in table."""
@@ -431,7 +452,7 @@ class CIBugLogApp(tk.Tk):
                         "jql": jql,
                         "startAt": start_at,
                         "maxResults": max_results,
-                        "fields": "key,created,summary,status,priority,assignee",
+                        "fields": "key,created,summary,status,priority,assignee,labels",
                     }
                     
                     resp = requests.get(url, headers=headers, params=params,
@@ -502,17 +523,35 @@ class CIBugLogApp(tk.Tk):
             status_name = status.get("name", "") if isinstance(status, dict) else str(status)
             priority = fields.get("priority", {})
             priority_name = priority.get("name", "—") if isinstance(priority, dict) else str(priority)
+            labels = fields.get("labels", [])
+            labels_name = ", ".join(labels) if isinstance(labels, list) else str(labels)
             assignee = fields.get("assignee")
             assignee_name = assignee.get("displayName", "Unassigned") if assignee else "Unassigned"
             
             self.jira_tree.insert("", "end", 
-                                 values=(key, created, summary, status_name, priority_name, assignee_name))
+                                 values=(key, created, summary, labels_name, status_name, priority_name, assignee_name))
 
         self._autofit_jira_columns()
+        self._apply_jira_filter_highlight()
+
+    def _on_jira_filter_changed(self, _event=None):
+        """React to typing in JIRA filter entry."""
+        self._apply_jira_filter_highlight()
+
+    def _apply_jira_filter_highlight(self):
+        """Highlight rows in yellow if any cell contains filter text."""
+        needle = self.jira_filter_var.get().strip().lower()
+        for item in self.jira_tree.get_children(""):
+            values = self.jira_tree.item(item, "values") or ()
+            haystack = " ".join(str(v).lower() for v in values)
+            if needle and needle in haystack:
+                self.jira_tree.item(item, tags=("jira_filter_match",))
+            else:
+                self.jira_tree.item(item, tags=())
 
     def _autofit_jira_columns(self):
         """Auto-fit JIRA columns to content and keep Summary visibly widest."""
-        cols = ("key", "created", "summary", "status", "priority", "assignee")
+        cols = ("key", "created", "summary", "labels", "status", "priority", "assignee")
         cell_font = tkfont.nametofont("TkDefaultFont")
 
         widths: dict[str, int] = {}
@@ -530,6 +569,7 @@ class CIBugLogApp(tk.Tk):
             "created": (120, 190),
             "status": (90, 170),
             "priority": (80, 140),
+            "labels": (120, 360),
             "assignee": (120, 260),
         }
         for col, (min_w, max_w) in caps.items():
