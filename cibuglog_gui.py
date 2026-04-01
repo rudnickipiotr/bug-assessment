@@ -83,6 +83,49 @@ def clean_cell(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _is_external_link_marker(text: str) -> bool:
+    return bool(re.search(r"external\s*url", text or "", re.I))
+
+
+def _normalize_result_url(url: str, jira_base: str, cibuglog_base: str) -> str:
+    u = (url or "").strip()
+    if not u or u.startswith("#"):
+        return ""
+    if u.startswith("http"):
+        return u
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("/browse/"):
+        return jira_base + u
+    if u.startswith("/"):
+        return cibuglog_base + u
+    return u
+
+
+def _looks_like_tree_url(url: str) -> bool:
+    return bool(re.search(r"(^|/)tree(?:[/?#]|$)", url or "", re.I))
+
+
+def _build_tree_url_from_row(test_name: str, machine_name: str, build_text: str) -> str:
+    test = (test_name or "").strip()
+    machine = (machine_name or "").strip()
+    build = (build_text or "").strip()
+    if not test or not machine or not build:
+        return ""
+
+    m = re.search(r"\b(xe-\d+)\b", build, re.I)
+    if not m:
+        return ""
+
+    build_id = m.group(1)
+    test_part = urllib.parse.quote(test, safe="@._-+")
+    machine_part = urllib.parse.quote(machine, safe="@._-+")
+    return (
+        f"https://gfx-ci-internal.igk.intel.com/tree/xe/{build_id}/"
+        f"{machine_part}/{test_part}.html"
+    )
+
+
 class CIBugLogApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -840,6 +883,7 @@ class CIBugLogApp(tk.Tk):
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._item_urls = {}
+        self._item_external_url = {}
 
     # -------------------------------------------------------- fetch / parse --
 
@@ -938,8 +982,8 @@ class CIBugLogApp(tk.Tk):
                     resp = resp2
 
             resp.raise_for_status()
-            count, rows, url_lists = self._parse(resp.text)
-            self.after(0, self._populate, count, rows, url_lists)
+            count, rows, url_lists, external_urls = self._parse(resp.text)
+            self.after(0, self._populate, count, rows, url_lists, external_urls)
         except requests.exceptions.ConnectionError as exc:
             self.after(0, self._on_error,
                        f"Connection failed.\n{exc}\n\n"
@@ -964,6 +1008,7 @@ class CIBugLogApp(tk.Tk):
 
         rows = []
         url_lists = []   # parallel list: URLs extracted from issue cell per row
+        external_urls = []  # parallel list: URL labeled as "external URL"
         if HAS_BS4:
             soup = BeautifulSoup(html, "html.parser")
             for table in soup.find_all("table"):
@@ -979,6 +1024,35 @@ class CIBugLogApp(tk.Tk):
                         issue_td = tds[6] if len(tds) > 6 else tds[-1]
                         urls = [a["href"] for a in issue_td.find_all("a", href=True)]
                         url_lists.append(urls)
+                        ext_url = ""
+                        for a in issue_td.find_all("a", href=True):
+                            around = []
+                            for sib in (a.previous_sibling, a.next_sibling):
+                                if sib is None:
+                                    continue
+                                if hasattr(sib, "get_text"):
+                                    s_txt = sib.get_text(" ", strip=True)
+                                else:
+                                    s_txt = str(sib).strip()
+                                if s_txt:
+                                    around.append(s_txt)
+                            markers = [
+                                a.get_text(" ", strip=True),
+                                a.get("title", ""),
+                                a.get("aria-label", ""),
+                                a.get("data-original-title", ""),
+                                " ".join(a.get("class", [])),
+                                " ".join(around),
+                            ]
+                            if any(_is_external_link_marker(m) for m in markers):
+                                ext_url = a["href"]
+                                break
+                        if not ext_url:
+                            for u in urls:
+                                if _looks_like_tree_url(u):
+                                    ext_url = u
+                                    break
+                        external_urls.append(ext_url)
         else:
             # Regex fallback
             for tr_m in re.finditer(r"<tr[^>]*>(.*?)</tr>", html, re.S | re.I):
@@ -998,13 +1072,51 @@ class CIBugLogApp(tk.Tk):
                 issue_raw = cells_raw[6].group(1) if len(cells_raw) > 6 else ""
                 urls = re.findall(r'href=["\']([^"\'>]+)["\']', issue_raw, re.I)
                 url_lists.append(urls)
+                ext_url = ""
+                for a_m in re.finditer(
+                    r"<a([^>]*)href=[\"']([^\"'>]+)[\"']([^>]*)>(.*?)</a>",
+                    issue_raw,
+                    re.I | re.S,
+                ):
+                    start, end = a_m.span()
+                    attrs = f"{a_m.group(1)} {a_m.group(3)}"
+                    label = re.sub(r"<[^>]+>", " ", a_m.group(4))
+                    label = re.sub(r"\s+", " ", label).strip()
+                    nearby_after = re.sub(r"<[^>]+>", " ", issue_raw[end:end + 140])
+                    nearby_before = re.sub(r"<[^>]+>", " ", issue_raw[max(0, start - 140):start])
+                    nearby = re.sub(r"\s+", " ", f"{nearby_before} {nearby_after}").strip()
+                    attr_markers = " ".join(re.findall(
+                        r"(?:title|aria-label|data-original-title|class)\s*=\s*[\"']([^\"']*)[\"']",
+                        attrs,
+                        re.I,
+                    ))
+                    if (
+                        _is_external_link_marker(label)
+                        or _is_external_link_marker(attr_markers)
+                        or _is_external_link_marker(nearby)
+                    ):
+                        ext_url = a_m.group(2)
+                        break
+                if not ext_url:
+                    for u in urls:
+                        if _looks_like_tree_url(u):
+                            ext_url = u
+                            break
+                external_urls.append(ext_url)
 
-        return count, rows, url_lists
+        return count, rows, url_lists, external_urls
 
-    def _populate(self, count: int, rows: list, url_lists: list | None = None):
+    def _populate(
+        self,
+        count: int,
+        rows: list,
+        url_lists: list | None = None,
+        external_urls: list | None = None,
+    ):
         self.progress.stop()
         self._clear_table()
         self._item_urls: dict[str, list[str]] = {}
+        self._item_external_url: dict[str, str] = {}
 
         if not rows:
             self._set_status("No results found." if count == 0 else
@@ -1030,6 +1142,20 @@ class CIBugLogApp(tk.Tk):
                                    tags=(tag,) if tag else ())
             if url_lists and i < len(url_lists):
                 self._item_urls[iid] = url_lists[i]
+
+            # Prefer deterministic /tree URL for rows marked as external URL.
+            if _is_external_link_marker(status_raw):
+                tree_url = _build_tree_url_from_row(display[0], display[1], display[5])
+                if tree_url:
+                    self._item_external_url[iid] = tree_url
+
+            if external_urls and i < len(external_urls) and external_urls[i]:
+                existing = self._item_external_url.get(iid, "")
+                candidate = external_urls[i]
+                if not existing:
+                    self._item_external_url[iid] = candidate
+                elif not _looks_like_tree_url(existing) and _looks_like_tree_url(candidate):
+                    self._item_external_url[iid] = candidate
 
     def _on_error(self, msg: str):
         self.progress.stop()
@@ -1082,21 +1208,61 @@ class CIBugLogApp(tk.Tk):
         self._ctx.add_command(label="Copy value", command=self._copy_value)
         self._ctx.add_command(label="Copy row",   command=self._copy_row)
 
+        jira_base = "https://jira.devtools.intel.com"
+        cibuglog_base = "https://gfx-ci-internal.igk.intel.com"
+        ext_raw = getattr(self, "_item_external_url", {}).get(item, "").strip()
+
+        # Strong fallback: infer external link from all row URLs.
+        if not ext_raw:
+            normalized_candidates = []
+            for u in getattr(self, "_item_urls", {}).get(item, []):
+                nu = _normalize_result_url(u, jira_base, cibuglog_base)
+                if nu:
+                    normalized_candidates.append(nu)
+
+            # Also scan visible row values for plain URLs.
+            vals = self.tree.item(item, "values") or ()
+            text_blob = " ".join(str(v) for v in vals)
+            for m in re.findall(r"https?://[^\s\]\)>'\"]+", text_blob, re.I):
+                normalized_candidates.append(m)
+
+            seen = set()
+            normalized_candidates = [u for u in normalized_candidates
+                                     if not (u in seen or seen.add(u))]
+
+            tree_candidates = [u for u in normalized_candidates if _looks_like_tree_url(u)]
+            if tree_candidates:
+                ext_raw = tree_candidates[0]
+
+            preferred = []
+            internal = []
+            for u in normalized_candidates:
+                lu = u.lower()
+                if "jira.devtools.intel.com" in lu or "gfx-ci-internal.igk.intel.com" in lu:
+                    internal.append(u)
+                else:
+                    preferred.append(u)
+
+            if not ext_raw and preferred:
+                ext_raw = preferred[0]
+            elif not ext_raw and internal:
+                ext_raw = internal[0]
+
+        if ext_raw:
+            ext_url = _normalize_result_url(ext_raw, jira_base, cibuglog_base)
+            self._ctx.add_separator()
+            self._ctx.add_command(
+                label="Open external URL",
+                command=lambda x=ext_url: webbrowser.open(x),
+            )
+
         # Collect URLs for this row
         raw_urls = getattr(self, "_item_urls", {}).get(item, [])
-        jira_base     = "https://jira.devtools.intel.com"
-        cibuglog_base = "https://gfx-ci-internal.igk.intel.com"
         urls = []
         for u in raw_urls:
-            u = u.strip()
-            if not u or u.startswith("#"):
-                continue
-            if u.startswith("http"):
-                urls.append(u)
-            elif u.startswith("/browse/"):
-                urls.append(jira_base + u)
-            elif u.startswith("/"):
-                urls.append(cibuglog_base + u)
+            nu = _normalize_result_url(u, jira_base, cibuglog_base)
+            if nu:
+                urls.append(nu)
         seen = set()
         urls = [u for u in urls if not (u in seen or seen.add(u))]
 
