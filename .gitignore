@@ -1,3 +1,4 @@
 jira_token
 cibuglog_history.json
 __pycache__/*
+tests/__pycache__/*
