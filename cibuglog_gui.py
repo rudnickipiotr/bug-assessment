@@ -250,14 +250,24 @@ class CIBugLogApp(tk.Tk):
         ttk.Label(fframe, text="e.g.  kasan|upstream",
                   foreground="gray").grid(row=3, column=4, padx=4, sticky="w")
 
-        # Row 4 – date filter
-        ttk.Label(fframe, text="AND").grid(row=4, column=0, padx=8, sticky="w")
-        ttk.Label(fframe, text="runconfig_added_on >").grid(
+        # Row 4 – stderr filter
+        self.stderr_conn = self._combo(fframe, ["AND", "AND NOT"], "AND", 4, 0)
+        ttk.Label(fframe, text="stderr").grid(
             row=4, column=1, padx=8, pady=3, sticky="w")
+        self.stderr_match = self._combo(fframe, ["= (exact)", "~= (regex/contains)"], "~= (regex/contains)", 4, 2)
+        self.stderr_value = ttk.Combobox(fframe, font=("Consolas", 10))
+        self.stderr_value.grid(row=4, column=3, padx=8, pady=3, sticky="ew")
+        ttk.Label(fframe, text="e.g.  out of bounds|null pointer",
+                  foreground="gray").grid(row=4, column=4, padx=4, sticky="w")
+
+        # Row 5 – date filter
+        ttk.Label(fframe, text="AND").grid(row=5, column=0, padx=8, sticky="w")
+        ttk.Label(fframe, text="runconfig_added_on >").grid(
+            row=5, column=1, padx=8, pady=3, sticky="w")
         ttk.Label(fframe, text="datetime( ... )").grid(
-            row=4, column=2, padx=8, sticky="w")
+            row=5, column=2, padx=8, sticky="w")
         date_row = ttk.Frame(fframe)
-        date_row.grid(row=4, column=3, padx=8, pady=3, sticky="w")
+        date_row.grid(row=5, column=3, padx=8, pady=3, sticky="w")
         self.date_value = ttk.Combobox(date_row, width=18, font=("Consolas", 10))
         self.date_value.grid(row=0, column=0)
         ttk.Label(date_row, text="  e.g. 2026-03-31   (optional)",
@@ -362,11 +372,11 @@ class CIBugLogApp(tk.Tk):
         self._ctx_col = None
 
         # Auto-update preview
-        for w in (self.test_value, self.machine_value, self.rc_value, self.date_value):
+        for w in (self.test_value, self.machine_value, self.rc_value, self.stderr_value, self.date_value):
             w.bind("<KeyRelease>", lambda _: self._update_preview())
             w.bind("<<ComboboxSelected>>", lambda _: self._update_preview())
         for w in (self.test_match, self.machine_conn, self.machine_match,
-                  self.rc_conn, self.rc_match):
+                  self.rc_conn, self.rc_match, self.stderr_conn, self.stderr_match):
             w.bind("<<ComboboxSelected>>", lambda _: self._update_preview())
 
     def _build_jira_ui(self):
@@ -819,6 +829,13 @@ class CIBugLogApp(tk.Tk):
             parts.append(f"{conn} {expr}" if parts else
                          (f"NOT {expr}" if "NOT" in conn else expr))
 
+        sv = self.stderr_value.get().strip()
+        if sv:
+            conn = self.stderr_conn.get()
+            expr = f"stderr{self._op(self.stderr_match.get())}'{sv}'"
+            parts.append(f"{conn} {expr}" if parts else
+                         (f"NOT {expr}" if "NOT" in conn else expr))
+
         dv = self.date_value.get().strip()
         if dv:
             expr = f"runconfig_added_on > datetime({dv})"
@@ -840,6 +857,7 @@ class CIBugLogApp(tk.Tk):
             self.test_value.get().strip(),
             self.machine_value.get().strip(),
             self.rc_value.get().strip(),
+            self.stderr_value.get().strip(),
             self.date_value.get().strip(),
         ])
         if all_empty:
@@ -899,6 +917,26 @@ class CIBugLogApp(tk.Tk):
             self.rc_value.delete(0, "end")
             self.rc_value.insert(0, val)
 
+        # stderr
+        sm = re.search(
+            r"(AND\s+NOT|AND)\s+stderr\s*(~?=)\s*'([^']*)'|"
+            r"^stderr\s*(~?=)\s*'([^']*)'",
+            raw, re.IGNORECASE)
+        if sm:
+            if sm.group(1):
+                conn = "AND NOT" if "NOT" in sm.group(1).upper() else "AND"
+                op   = sm.group(2)
+                val  = sm.group(3)
+            else:
+                conn = "AND"
+                op   = sm.group(4)
+                val  = sm.group(5)
+            self.stderr_conn.set(conn)
+            self.stderr_match.set(
+                "~= (regex/contains)" if op and "~" in op else "= (exact)")
+            self.stderr_value.delete(0, "end")
+            self.stderr_value.insert(0, val)
+
         # date
         dm = re.search(r"runconfig_added_on\s*>\s*datetime\(([^)]+)\)", raw, re.IGNORECASE)
         self.date_value.delete(0, "end")
@@ -920,13 +958,15 @@ class CIBugLogApp(tk.Tk):
             webbrowser.open(self._get_cibuglog_results_base() + "?query=" + urllib.parse.quote(q))
 
     def _clear_all(self):
-        for w in (self.test_value, self.machine_value, self.rc_value, self.date_value):
+        for w in (self.test_value, self.machine_value, self.rc_value, self.stderr_value, self.date_value):
             w.delete(0, "end")
         self.test_match.set("= (exact)")
         self.machine_conn.set("AND")
         self.machine_match.set("~= (regex/contains)")
         self.rc_conn.set("AND NOT")
         self.rc_match.set("~= (regex/contains)")
+        self.stderr_conn.set("AND")
+        self.stderr_match.set("~= (regex/contains)")
         self._update_preview()
         self._clear_table()
         self.count_var.set("")
