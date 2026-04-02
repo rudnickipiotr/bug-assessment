@@ -54,6 +54,21 @@ class TestCIBugLogHelpers(unittest.TestCase):
             "hwre-NVL_P-061/igt@xe_eudebug_online@pagefault-one-of-many.html",
         )
 
+    def test_build_tree_url_from_row_with_tags_and_runconfig(self):
+        url = gui._build_tree_url_from_row(
+            test_name="igt@xe_eudebug_online@systolic-fp-exception-overflow",
+            machine_name="simfull-jgs_EDP_EUDBG_CORAL",
+            build_text="xe-rtl-val-jgs-153-full",
+            cibuglog_origin="https://gfx-ci-internal.igk.intel.com",
+            tags_text="CORAL , EDP , EUDBG , JGS",
+        )
+        self.assertEqual(
+            url,
+            "https://gfx-ci-internal.igk.intel.com/tree/xe-rtl-validation-jgs/"
+            "xe-rtl-val-jgs-153/simfull-jgs_EDP_EUDBG_CORAL/"
+            "igt@xe_eudebug_online@systolic-fp-exception-overflow.html",
+        )
+
     def test_build_tree_url_from_row_returns_empty_when_build_id_missing(self):
         self.assertEqual(
             gui._build_tree_url_from_row(

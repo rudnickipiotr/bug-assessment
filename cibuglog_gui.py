@@ -114,12 +114,49 @@ def _build_tree_url_from_row(
     machine_name: str,
     build_text: str,
     cibuglog_origin: str,
+    tags_text: str = "",
 ) -> str:
     test = (test_name or "").strip()
     machine = (machine_name or "").strip()
     build = (build_text or "").strip()
+    tags = (tags_text or "").strip()
     if not test or not machine or not build:
         return ""
+
+    # Newer rows carry tree path as: <tags>/<runconfig>.
+    # Strip UI suffixes like "(1 day old)" before URL assembly.
+    build_clean = re.sub(r"\s*\([^)]*\)\s*$", "", build).strip()
+    tags_clean = re.sub(r"\s*\([^)]*\)\s*$", "", tags).strip()
+
+    # Build from tags only when tags look like a single path token.
+    if (
+        tags_clean
+        and build_clean
+        and "/" not in build_clean
+        and "," not in tags_clean
+        and re.fullmatch(r"[A-Za-z0-9._@+-]+", tags_clean)
+    ):
+        tags_part = urllib.parse.quote(tags_clean, safe="@._-+")
+        build_part = urllib.parse.quote(build_clean, safe="@._-+")
+        test_part = urllib.parse.quote(test, safe="@._-+")
+        machine_part = urllib.parse.quote(machine, safe="@._-+")
+        return (
+            f"{cibuglog_origin.rstrip('/')}/tree/{tags_part}/{build_part}/"
+            f"{machine_part}/{test_part}.html"
+        )
+
+    # Heuristic for RTL validation builds, e.g. xe-rtl-val-jgs-153-full.
+    rtl_m = re.match(r"^(xe-rtl-val-([a-z0-9]+)-\d+)(?:-[a-z0-9]+)?$", build_clean, re.I)
+    if rtl_m:
+        build_part = rtl_m.group(1)
+        platform = rtl_m.group(2).lower()
+        tags_part = f"xe-rtl-validation-{platform}"
+        test_part = urllib.parse.quote(test, safe="@._-+")
+        machine_part = urllib.parse.quote(machine, safe="@._-+")
+        return (
+            f"{cibuglog_origin.rstrip('/')}/tree/{tags_part}/{build_part}/"
+            f"{machine_part}/{test_part}.html"
+        )
 
     m = re.search(r"\b(xe-\d+)\b", build, re.I)
     if not m:
@@ -1168,6 +1205,7 @@ class CIBugLogApp(tk.Tk):
                     display[1],
                     display[5],
                     self._get_cibuglog_origin(),
+                    display[2],
                 )
 
             # drop duration (index 4) — not shown in table
@@ -1178,18 +1216,18 @@ class CIBugLogApp(tk.Tk):
             if url_lists and i < len(url_lists):
                 self._item_urls[iid] = url_lists[i]
 
-            # Prefer deterministic /tree URL for rows marked as external URL.
-            if _is_external_link_marker(status_raw):
-                if tree_url:
-                    self._item_external_url[iid] = tree_url
-
             if external_urls and i < len(external_urls) and external_urls[i]:
                 existing = self._item_external_url.get(iid, "")
                 candidate = external_urls[i]
                 if not existing:
                     self._item_external_url[iid] = candidate
-                elif not _looks_like_tree_url(existing) and _looks_like_tree_url(candidate):
+                elif _looks_like_tree_url(candidate):
                     self._item_external_url[iid] = candidate
+
+            # Fallback to deterministic /tree URL only if parsing did not provide one.
+            if _is_external_link_marker(status_raw) and tree_url:
+                if not self._item_external_url.get(iid):
+                    self._item_external_url[iid] = tree_url
 
     def _on_error(self, msg: str):
         self.progress.stop()
