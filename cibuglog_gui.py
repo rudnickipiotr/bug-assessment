@@ -357,7 +357,8 @@ class CIBugLogApp(tk.Tk):
 
         # Context menu – rebuilt dynamically on each right-click
         self._ctx = tk.Menu(self, tearoff=0)
-        self.tree.bind("<Button-3>", self._show_ctx)
+        self.tree.bind("<ButtonRelease-3>", self._show_ctx)
+        self.tree.bind("<Control-Button-1>", self._show_ctx)
         self._ctx_col = None
 
         # Auto-update preview
@@ -424,7 +425,7 @@ class CIBugLogApp(tk.Tk):
         tframe.rowconfigure(0, weight=1)
         tframe.columnconfigure(0, weight=1)
         
-        cols = ("key", "created", "summary", "labels", "status", "priority", "assignee")
+        cols = ("key", "created", "summary", "labels", "status", "assignee")
         self.jira_tree = ttk.Treeview(tframe, columns=cols, show="headings", selectmode="extended")
         
         col_cfg = [
@@ -433,7 +434,6 @@ class CIBugLogApp(tk.Tk):
             ("summary",  "Summary",   420),
             ("labels",   "Labels",    160),
             ("status",   "Status",    100),
-            ("priority", "Priority",  80),
             ("assignee", "Assignee",  150),
         ]
         for cid, heading, width in col_cfg:
@@ -459,7 +459,6 @@ class CIBugLogApp(tk.Tk):
         # Context menu for JIRA rows
         self._jira_ctx = tk.Menu(self, tearoff=0)
         self._jira_ctx_col = None
-        self.jira_tree.bind("<Button-3>", self._show_jira_ctx)
         self.jira_tree.bind("<ButtonRelease-3>", self._show_jira_ctx)
         self.jira_tree.bind("<Control-Button-1>", self._show_jira_ctx)
         
@@ -620,15 +619,13 @@ class CIBugLogApp(tk.Tk):
             summary = fields.get("summary", "")
             status = fields.get("status", {})
             status_name = status.get("name", "") if isinstance(status, dict) else str(status)
-            priority = fields.get("priority", {})
-            priority_name = priority.get("name", "—") if isinstance(priority, dict) else str(priority)
             labels = fields.get("labels", [])
             labels_name = ", ".join(labels) if isinstance(labels, list) else str(labels)
             assignee = fields.get("assignee")
             assignee_name = assignee.get("displayName", "Unassigned") if assignee else "Unassigned"
             
             self.jira_tree.insert("", "end", 
-                                 values=(key, created, summary, labels_name, status_name, priority_name, assignee_name))
+                                 values=(key, created, summary, labels_name, status_name, assignee_name))
 
         self._autofit_jira_columns()
         self._apply_jira_filter_highlight()
@@ -650,7 +647,7 @@ class CIBugLogApp(tk.Tk):
 
     def _autofit_jira_columns(self):
         """Auto-fit JIRA columns to content and keep Summary visibly widest."""
-        cols = ("key", "created", "summary", "labels", "status", "priority", "assignee")
+        cols = ("key", "created", "summary", "labels", "status", "assignee")
         cell_font = tkfont.nametofont("TkDefaultFont")
 
         widths: dict[str, int] = {}
@@ -667,7 +664,6 @@ class CIBugLogApp(tk.Tk):
             "key": (90, 180),
             "created": (120, 190),
             "status": (90, 170),
-            "priority": (80, 140),
             "labels": (120, 360),
             "assignee": (120, 260),
         }
@@ -723,7 +719,7 @@ class CIBugLogApp(tk.Tk):
         """Show context menu for a row in the JIRA table."""
         item = self.jira_tree.identify_row(event.y)
         if not item:
-            return
+            return "break"
 
         self.jira_tree.selection_set(item)
         col_id = self.jira_tree.identify_column(event.x)
@@ -739,6 +735,7 @@ class CIBugLogApp(tk.Tk):
             self._jira_ctx.tk_popup(event.x_root, event.y_root)
         finally:
             self._jira_ctx.grab_release()
+        return "break"
 
     def _open_selected_jira_issue(self):
         """Open selected JIRA issue key from the table row in browser."""
@@ -1270,7 +1267,7 @@ class CIBugLogApp(tk.Tk):
     def _show_ctx(self, event):
         item = self.tree.identify_row(event.y)
         if not item:
-            return
+            return "break"
         self.tree.selection_set(item)
         col_id = self.tree.identify_column(event.x)
         self._ctx_col = int(col_id.lstrip("#")) - 1 if col_id else None
@@ -1357,7 +1354,11 @@ class CIBugLogApp(tk.Tk):
                 self._ctx.add_command(label=label,
                                       command=lambda x=u: webbrowser.open(x))
 
-        self._ctx.tk_popup(event.x_root, event.y_root)
+        try:
+            self._ctx.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._ctx.grab_release()
+        return "break"
 
     def _copy_value(self):
         sel = self.tree.selection()
