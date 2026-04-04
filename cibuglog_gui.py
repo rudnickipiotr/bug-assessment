@@ -404,15 +404,44 @@ class CIBugLogApp(tk.Tk):
         # Default JIRA query
         default_jql = (
             "project = VLK AND component = XeKMD AND component = \"Kernel - core\" "
-            "AND priority = Undecided AND Exposure = Unset AND status != Closed "
-            "AND status != Rejected AND type = Bug"
+            "AND priority = Undecided AND Exposure = Unset AND statusCategory != Done "
+	    "AND type = Bug"
         )
         self.jira_default_jql = default_jql
+        self.jira_query_presets = {
+            "Default (XeKMD Core Undecided)": default_jql,
+            "Open XeKMD Core Bugs": (
+                "project = VLK AND component = XeKMD AND component = \"Kernel - core\" "
+                "AND statusCategory != Done AND type = Bug"
+            ),
+            "Default + Assigned to me": (
+                "project = VLK AND component = XeKMD AND component = \"Kernel - core\" "
+                "AND statusCategory != Done AND type = Bug AND assignee = currentUser()"
+            ),
+            "VLK search": (
+                "project = VLK AND component = XeKMD AND component = \"Kernel - core\" "
+		"AND created >= -90d AND text ~ ' '"
+            )
+        }
         
         # ---- Query Field ----
-        qframe = ttk.LabelFrame(self.jira_frame, text=" JQL Query ", padding=(10, 4))
+        qframe = ttk.Frame(self.jira_frame, padding=(10, 4))
         qframe.pack(fill="x", padx=10, pady=(10, 4))
         qframe.columnconfigure(0, weight=1)
+
+        preset_row = ttk.Frame(qframe)
+        preset_row.pack(fill="x", padx=6, pady=(2, 2))
+        ttk.Label(preset_row, text="JQL Query:").pack(side="left")
+        self.jira_preset_var = tk.StringVar(value="Default (XeKMD Core Undecided)")
+        self.jira_preset_cb = ttk.Combobox(
+            preset_row,
+            textvariable=self.jira_preset_var,
+            values=list(self.jira_query_presets.keys()),
+            state="readonly",
+            width=38,
+        )
+        self.jira_preset_cb.pack(side="left", padx=(6, 0))
+        self.jira_preset_cb.bind("<<ComboboxSelected>>", self._on_jira_preset_selected)
         
         self.jira_query_text = tk.Text(qframe, font=("Consolas", 9), height=3, width=100)
         self.jira_query_text.pack(fill="both", expand=False, padx=6, pady=4)
@@ -543,10 +572,24 @@ class CIBugLogApp(tk.Tk):
         self.clipboard_append(jql)
         self.jira_status_label.configure(text="Query copied to clipboard", foreground="gray")
 
+    def _set_jira_query_text(self, jql: str):
+        """Set JQL text widget content."""
+        self.jira_query_text.delete("1.0", "end")
+        self.jira_query_text.insert("1.0", jql)
+
+    def _on_jira_preset_selected(self, _event=None):
+        """Load selected JQL preset into query text box."""
+        preset_name = self.jira_preset_var.get().strip()
+        jql = self.jira_query_presets.get(preset_name, "")
+        if not jql:
+            return
+        self._set_jira_query_text(jql)
+        self.jira_status_label.configure(text=f"Preset loaded: {preset_name}", foreground="gray")
+
     def _on_restore_jira_default_clicked(self):
         """Restore default JQL query in the text field."""
-        self.jira_query_text.delete("1.0", "end")
-        self.jira_query_text.insert("1.0", self.jira_default_jql)
+        self.jira_preset_var.set("Default (XeKMD Core Undecided)")
+        self._set_jira_query_text(self.jira_default_jql)
         self.jira_status_label.configure(text="Default query restored", foreground="gray")
 
     def _auto_fetch_jira_on_startup(self):
