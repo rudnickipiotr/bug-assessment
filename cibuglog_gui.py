@@ -54,6 +54,8 @@ PROXIES = {
     "https": "http://proxy-dmz.intel.com:912",
 }
 HISTORY_FILE = Path(__file__).with_name("cibuglog_history.json")
+DEFAULT_JIRA_PRESET_NAME = "Default (XeKMD Core Undecided)"
+ASSIGNED_TO_ME_PRESET_NAME = "Default + Assigned to me"
 
 STATUS_COLORS = {
     "pass":       ("#d4edda", "#155724"),
@@ -188,6 +190,54 @@ def _split_runconfig_name_and_date(runconfig_text: str) -> tuple[str, str]:
         return name_part, date_part
 
     return text, ""
+
+
+def _truncate_text(text: str, max_len: int) -> str:
+    """Truncate text to max_len characters, using ellipsis when needed."""
+    s = str(text or "")
+    if max_len <= 0:
+        return ""
+    if len(s) <= max_len:
+        return s
+    if max_len <= 3:
+        return s[:max_len]
+    return s[: max_len - 3].rstrip() + "..."
+
+
+def _should_show_priority_for_preset(preset_name: str) -> bool:
+    """Return True when Priority column should be visible for selected preset."""
+    return (preset_name or "").strip() != DEFAULT_JIRA_PRESET_NAME
+
+
+def _should_show_assigned_for_preset(preset_name: str) -> bool:
+    """Return True when Assignee column should be visible for selected preset."""
+    return (preset_name or "").strip() != ASSIGNED_TO_ME_PRESET_NAME
+
+
+def _should_show_updated_for_preset(preset_name: str) -> bool:
+    """Return True when Last comment column should be visible for selected preset."""
+    return (preset_name or "").strip() == ASSIGNED_TO_ME_PRESET_NAME
+
+
+def _extract_last_comment_created(comment_field) -> str:
+    """Extract the newest comment 'created' timestamp from JIRA comment field."""
+    if not isinstance(comment_field, dict):
+        return ""
+    comments = comment_field.get("comments", [])
+    if not isinstance(comments, list) or not comments:
+        return ""
+
+    created_values = []
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        created_raw = str(comment.get("created", "") or "").strip()
+        if created_raw:
+            created_values.append(created_raw)
+
+    if not created_values:
+        return ""
+    return max(created_values)
 
 
 class CIBugLogApp(tk.Tk):
@@ -409,12 +459,12 @@ class CIBugLogApp(tk.Tk):
         )
         self.jira_default_jql = default_jql
         self.jira_query_presets = {
-            "Default (XeKMD Core Undecided)": default_jql,
+            DEFAULT_JIRA_PRESET_NAME: default_jql,
             "Open XeKMD Core Bugs": (
                 "project = VLK AND component = XeKMD AND component = \"Kernel - core\" "
                 "AND statusCategory != Done AND type = Bug"
             ),
-            "Default + Assigned to me": (
+            ASSIGNED_TO_ME_PRESET_NAME: (
                 "project = VLK AND component = XeKMD AND component = \"Kernel - core\" "
                 "AND statusCategory != Done AND type = Bug AND assignee = currentUser()"
             ),
@@ -432,7 +482,7 @@ class CIBugLogApp(tk.Tk):
         preset_row = ttk.Frame(qframe)
         preset_row.pack(fill="x", padx=6, pady=(2, 2))
         ttk.Label(preset_row, text="JQL Query:").pack(side="left")
-        self.jira_preset_var = tk.StringVar(value="Default (XeKMD Core Undecided)")
+        self.jira_preset_var = tk.StringVar(value=DEFAULT_JIRA_PRESET_NAME)
         self.jira_preset_cb = ttk.Combobox(
             preset_row,
             textvariable=self.jira_preset_var,
@@ -442,6 +492,27 @@ class CIBugLogApp(tk.Tk):
         )
         self.jira_preset_cb.pack(side="left", padx=(6, 0))
         self.jira_preset_cb.bind("<<ComboboxSelected>>", self._on_jira_preset_selected)
+        self.jira_show_priority_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            preset_row,
+            text="Show priority",
+            variable=self.jira_show_priority_var,
+            command=self._on_jira_show_priority_toggled,
+        ).pack(side="left", padx=(10, 0))
+        self.jira_show_assigned_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            preset_row,
+            text="assigned",
+            variable=self.jira_show_assigned_var,
+            command=self._on_jira_show_assigned_toggled,
+        ).pack(side="left", padx=(10, 0))
+        self.jira_show_updated_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            preset_row,
+            text="last comment",
+            variable=self.jira_show_updated_var,
+            command=self._on_jira_show_updated_toggled,
+        ).pack(side="left", padx=(10, 0))
         
         self.jira_query_text = tk.Text(qframe, font=("Consolas", 9), height=3, width=100)
         self.jira_query_text.pack(fill="both", expand=False, padx=6, pady=4)
@@ -494,15 +565,18 @@ class CIBugLogApp(tk.Tk):
         tframe.rowconfigure(0, weight=1)
         tframe.columnconfigure(0, weight=1)
         
-        cols = ("key", "created", "summary", "labels", "status", "assignee")
+        cols = ("key", "created", "last_comment", "summary", "labels", "status", "priority", "assignee")
+        self._jira_columns = cols
         self.jira_tree = ttk.Treeview(tframe, columns=cols, show="headings", selectmode="extended")
         
         col_cfg = [
             ("key",      "Key",       100),
             ("created",  "Created",   135),
+            ("last_comment", "Last comment", 135),
             ("summary",  "Summary",   420),
             ("labels",   "Labels",    160),
             ("status",   "Status",    100),
+            ("priority", "Priority",  100),
             ("assignee", "Assignee",  150),
         ]
         for cid, heading, width in col_cfg:
@@ -541,6 +615,7 @@ class CIBugLogApp(tk.Tk):
         self._jira_summary_tooltip_label = None
         self._jira_summary_tooltip_job = None
         self._jira_summary_hover_item = None
+        self._update_jira_display_columns()
 
     def _get_jira_query(self) -> str:
         """Get JQL query from text widget."""
@@ -584,13 +659,54 @@ class CIBugLogApp(tk.Tk):
         if not jql:
             return
         self._set_jira_query_text(jql)
+        self.jira_show_priority_var.set(_should_show_priority_for_preset(preset_name))
+        self.jira_show_assigned_var.set(_should_show_assigned_for_preset(preset_name))
+        self.jira_show_updated_var.set(_should_show_updated_for_preset(preset_name))
+        self._update_jira_display_columns()
         self.jira_status_label.configure(text=f"Preset loaded: {preset_name}", foreground="gray")
 
     def _on_restore_jira_default_clicked(self):
         """Restore default JQL query in the text field."""
-        self.jira_preset_var.set("Default (XeKMD Core Undecided)")
+        self.jira_preset_var.set(DEFAULT_JIRA_PRESET_NAME)
         self._set_jira_query_text(self.jira_default_jql)
+        self.jira_show_priority_var.set(False)
+        self.jira_show_assigned_var.set(True)
+        self.jira_show_updated_var.set(False)
+        self._update_jira_display_columns()
         self.jira_status_label.configure(text="Default query restored", foreground="gray")
+
+    def _on_jira_show_priority_toggled(self):
+        """Show or hide Priority column based on checkbox state."""
+        self._update_jira_display_columns()
+
+    def _on_jira_show_assigned_toggled(self):
+        """Show or hide Assignee column based on checkbox state."""
+        self._update_jira_display_columns()
+
+    def _on_jira_show_updated_toggled(self):
+        """Show or hide Last comment column based on checkbox state."""
+        self._update_jira_display_columns()
+
+    def _set_jira_priority_column_visible(self, visible: bool):
+        """Control whether JIRA Priority column is visible in the table."""
+        self.jira_show_priority_var.set(bool(visible))
+        self._update_jira_display_columns()
+
+    def _update_jira_display_columns(self):
+        """Apply checkbox-driven visibility rules for optional JIRA columns."""
+        show_priority = self.jira_show_priority_var.get()
+        show_assigned = self.jira_show_assigned_var.get()
+        display_cols = []
+        for col in self._jira_columns:
+            if col == "last_comment" and not self.jira_show_updated_var.get():
+                continue
+            if col == "priority" and not show_priority:
+                continue
+            if col == "assignee" and not show_assigned:
+                continue
+            display_cols.append(col)
+        self.jira_tree.configure(displaycolumns=tuple(display_cols))
+        self._autofit_jira_columns()
 
     def _auto_fetch_jira_on_startup(self):
         """Fetch JIRA issues automatically once the app starts."""
@@ -647,7 +763,7 @@ class CIBugLogApp(tk.Tk):
                         "jql": jql,
                         "startAt": start_at,
                         "maxResults": max_results,
-                        "fields": "key,created,summary,status,priority,assignee,labels",
+                        "fields": "key,created,summary,status,priority,assignee,labels,comment",
                     }
                     
                     resp = requests.get(url, headers=headers, params=params,
@@ -716,14 +832,20 @@ class CIBugLogApp(tk.Tk):
             fields = issue.get("fields", {})
             key = issue.get("key", "")
             created = self._format_jira_created(fields.get("created", ""))
+            last_comment = self._format_jira_created(
+                _extract_last_comment_created(fields.get("comment", {}))
+            )
             summary = fields.get("summary", "")
             status = fields.get("status", {})
             status_name = status.get("name", "") if isinstance(status, dict) else str(status)
             labels = fields.get("labels", [])
             labels_name = ", ".join(labels) if isinstance(labels, list) else str(labels)
+            labels_name = _truncate_text(labels_name, 20)
+            priority = fields.get("priority", {})
+            priority_name = priority.get("name", "") if isinstance(priority, dict) else str(priority)
             assignee = fields.get("assignee")
             assignee_name = assignee.get("displayName", "Unassigned") if assignee else "Unassigned"
-            all_rows.append((key, created, summary, labels_name, status_name, assignee_name))
+            all_rows.append((key, created, last_comment, summary, labels_name, status_name, priority_name, assignee_name))
 
         self._jira_all_rows = all_rows
         self._apply_jira_filter_highlight()
@@ -762,7 +884,7 @@ class CIBugLogApp(tk.Tk):
 
     def _autofit_jira_columns(self):
         """Auto-fit JIRA columns to content and keep Summary visibly widest."""
-        cols = ("key", "created", "summary", "labels", "status", "assignee")
+        cols = self._jira_columns
         cell_font = tkfont.nametofont("TkDefaultFont")
 
         widths: dict[str, int] = {}
@@ -778,7 +900,9 @@ class CIBugLogApp(tk.Tk):
         caps = {
             "key": (90, 180),
             "created": (120, 190),
+            "last_comment": (120, 190),
             "status": (90, 170),
+            "priority": (90, 170),
             "labels": (120, 360),
             "assignee": (120, 260),
         }
@@ -838,7 +962,7 @@ class CIBugLogApp(tk.Tk):
 
         self.jira_tree.selection_set(item)
         col_id = self.jira_tree.identify_column(event.x)
-        self._jira_ctx_col = int(col_id.lstrip("#")) - 1 if col_id else None
+        self._jira_ctx_col = self._get_jira_column_value_index(col_id)
 
         self._jira_ctx.delete(0, "end")
         self._jira_ctx.add_command(label="Open issue in JIRA",
@@ -889,12 +1013,13 @@ class CIBugLogApp(tk.Tk):
         row_id = self.jira_tree.identify_row(event.y)
         col_id = self.jira_tree.identify_column(event.x)
 
-        if col_id != "#3" or not row_id:
+        if self._get_jira_column_id(col_id) != "summary" or not row_id:
             self._hide_jira_summary_tooltip()
             return
 
         values = self.jira_tree.item(row_id, "values") or ()
-        summary_text = str(values[2]).strip() if len(values) > 2 else ""
+        summary_idx = self._jira_columns.index("summary")
+        summary_text = str(values[summary_idx]).strip() if len(values) > summary_idx else ""
         if not summary_text:
             self._hide_jira_summary_tooltip()
             return
@@ -912,13 +1037,45 @@ class CIBugLogApp(tk.Tk):
             lambda rid=row_id, text=summary_text: self._show_jira_summary_tooltip(rid, text),
         )
 
+    def _get_jira_column_id(self, col_id: str) -> str:
+        """Map Treeview display column id (e.g. #3) to logical JIRA column id."""
+        if not col_id:
+            return ""
+        try:
+            display_idx = int(str(col_id).lstrip("#")) - 1
+        except ValueError:
+            return ""
+        display_cols = list(self.jira_tree.cget("displaycolumns") or ())
+        if display_idx < 0 or display_idx >= len(display_cols):
+            return ""
+        return str(display_cols[display_idx])
+
+    def _get_jira_column_value_index(self, col_id: str):
+        """Return index in row values tuple for a display column id."""
+        logical_col = self._get_jira_column_id(col_id)
+        if not logical_col:
+            return None
+        try:
+            return self._jira_columns.index(logical_col)
+        except ValueError:
+            return None
+
+    def _get_jira_display_column_for(self, logical_col: str) -> str:
+        """Return Treeview display column token (e.g. #4) for a logical column id."""
+        display_cols = list(self.jira_tree.cget("displaycolumns") or ())
+        for idx, col in enumerate(display_cols, start=1):
+            if str(col) == logical_col:
+                return f"#{idx}"
+        return ""
+
     def _show_jira_summary_tooltip(self, row_id: str, text: str):
         """Show tooltip with full Summary text for hovered row."""
         self._jira_summary_tooltip_job = None
         if self._jira_summary_hover_item != row_id:
             return
 
-        bbox = self.jira_tree.bbox(row_id, "#3")
+        summary_col = self._get_jira_display_column_for("summary")
+        bbox = self.jira_tree.bbox(row_id, summary_col) if summary_col else None
         if not bbox:
             return
 

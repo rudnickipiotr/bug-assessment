@@ -5,6 +5,45 @@ import cibuglog_gui as gui
 
 
 class TestCIBugLogHelpers(unittest.TestCase):
+    def test_extract_last_comment_created(self):
+        comment_field = {
+            "comments": [
+                {"created": "2026-04-01T10:00:00.000+0000"},
+                {"created": "2026-04-03T09:30:00.000+0000"},
+                {"created": "2026-04-02T12:00:00.000+0000"},
+            ]
+        }
+        self.assertEqual(
+            gui._extract_last_comment_created(comment_field),
+            "2026-04-03T09:30:00.000+0000",
+        )
+
+    def test_extract_last_comment_created_empty(self):
+        self.assertEqual(gui._extract_last_comment_created({}), "")
+        self.assertEqual(gui._extract_last_comment_created({"comments": []}), "")
+
+    def test_should_show_updated_for_preset(self):
+        self.assertTrue(gui._should_show_updated_for_preset(gui.ASSIGNED_TO_ME_PRESET_NAME))
+        self.assertFalse(gui._should_show_updated_for_preset(gui.DEFAULT_JIRA_PRESET_NAME))
+
+    def test_should_show_assigned_for_preset(self):
+        self.assertFalse(gui._should_show_assigned_for_preset(gui.ASSIGNED_TO_ME_PRESET_NAME))
+        self.assertTrue(gui._should_show_assigned_for_preset(gui.DEFAULT_JIRA_PRESET_NAME))
+
+    def test_should_show_priority_for_preset(self):
+        self.assertFalse(gui._should_show_priority_for_preset(gui.DEFAULT_JIRA_PRESET_NAME))
+        self.assertTrue(gui._should_show_priority_for_preset("Open XeKMD Core Bugs"))
+
+    def test_truncate_text(self):
+        self.assertEqual(gui._truncate_text("short", 20), "short")
+        self.assertEqual(gui._truncate_text("x" * 20, 20), "x" * 20)
+        self.assertEqual(gui._truncate_text("x" * 21, 20), ("x" * 17) + "...")
+
+    def test_truncate_text_small_limits(self):
+        self.assertEqual(gui._truncate_text("abcdef", 3), "abc")
+        self.assertEqual(gui._truncate_text("abcdef", 2), "ab")
+        self.assertEqual(gui._truncate_text("abcdef", 0), "")
+
     def test_classify_status(self):
         self.assertEqual(gui.classify_status("PASS"), "pass")
         self.assertEqual(gui.classify_status("skip ( external URL )"), "skip")
