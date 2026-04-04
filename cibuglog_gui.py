@@ -387,6 +387,7 @@ class CIBugLogApp(tk.Tk):
             "AND priority = Undecided AND Exposure = Unset AND status != Closed "
             "AND status != Rejected AND type = Bug"
         )
+        self.jira_default_jql = default_jql
         
         # ---- Query Field ----
         qframe = ttk.LabelFrame(self.jira_frame, text=" JQL Query ", padding=(10, 4))
@@ -408,6 +409,8 @@ class CIBugLogApp(tk.Tk):
                    command=self._on_open_jira_clicked).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Copy Query",
                    command=self._on_copy_jira_clicked).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Restore default",
+               command=self._on_restore_jira_default_clicked).pack(side="left", padx=4)
         
         self.jira_status_label = ttk.Label(btn_frame, text="Ready", foreground="gray")
         self.jira_status_label.pack(side="left", padx=16)
@@ -423,6 +426,13 @@ class CIBugLogApp(tk.Tk):
         self.jira_filter_entry = ttk.Entry(filter_frame, textvariable=self.jira_filter_var)
         self.jira_filter_entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
         self.jira_filter_entry.bind("<KeyRelease>", self._on_jira_filter_changed)
+        self.jira_filter_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_frame,
+            text="Show only matches",
+            variable=self.jira_filter_only_var,
+            command=self._on_jira_filter_changed,
+        ).pack(side="left", padx=(8, 0))
         
         # ---- Count label ----
         self.jira_count_var = tk.StringVar(value="")
@@ -471,9 +481,17 @@ class CIBugLogApp(tk.Tk):
         self._jira_ctx_col = None
         self.jira_tree.bind("<ButtonRelease-3>", self._show_jira_ctx)
         self.jira_tree.bind("<Control-Button-1>", self._show_jira_ctx)
+        self.jira_tree.bind("<Motion>", self._on_jira_tree_motion)
+        self.jira_tree.bind("<Leave>", self._hide_jira_summary_tooltip)
+        self.jira_tree.bind("<Button-1>", self._hide_jira_summary_tooltip)
         
         # Store sort state for JIRA table
         self._jira_sort_reverse = {}
+        self._jira_all_rows = []
+        self._jira_summary_tooltip = None
+        self._jira_summary_tooltip_label = None
+        self._jira_summary_tooltip_job = None
+        self._jira_summary_hover_item = None
 
     def _get_jira_query(self) -> str:
         """Get JQL query from text widget."""
@@ -504,6 +522,12 @@ class CIBugLogApp(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(jql)
         self.jira_status_label.configure(text="Query copied to clipboard", foreground="gray")
+
+    def _on_restore_jira_default_clicked(self):
+        """Restore default JQL query in the text field."""
+        self.jira_query_text.delete("1.0", "end")
+        self.jira_query_text.insert("1.0", self.jira_default_jql)
+        self.jira_status_label.configure(text="Default query restored", foreground="gray")
 
     def _auto_fetch_jira_on_startup(self):
         """Fetch JIRA issues automatically once the app starts."""
@@ -613,15 +637,18 @@ class CIBugLogApp(tk.Tk):
         
         threading.Thread(target=worker, daemon=True).start()
 
-    def _clear_jira_table(self):
+    def _clear_jira_table(self, clear_cache: bool = True):
         """Clear JIRA results table."""
         for item in self.jira_tree.get_children():
             self.jira_tree.delete(item)
+        if clear_cache:
+            self._jira_all_rows = []
 
     def _populate_jira_table(self, issues: list):
         """Populate JIRA table with fetched issues."""
         self._clear_jira_table()
         
+        all_rows = []
         for issue in issues:
             fields = issue.get("fields", {})
             key = issue.get("key", "")
@@ -633,11 +660,9 @@ class CIBugLogApp(tk.Tk):
             labels_name = ", ".join(labels) if isinstance(labels, list) else str(labels)
             assignee = fields.get("assignee")
             assignee_name = assignee.get("displayName", "Unassigned") if assignee else "Unassigned"
-            
-            self.jira_tree.insert("", "end", 
-                                 values=(key, created, summary, labels_name, status_name, assignee_name))
+            all_rows.append((key, created, summary, labels_name, status_name, assignee_name))
 
-        self._autofit_jira_columns()
+        self._jira_all_rows = all_rows
         self._apply_jira_filter_highlight()
 
     def _on_jira_filter_changed(self, _event=None):
@@ -645,15 +670,32 @@ class CIBugLogApp(tk.Tk):
         self._apply_jira_filter_highlight()
 
     def _apply_jira_filter_highlight(self):
-        """Highlight rows in yellow if any cell contains filter text."""
+        """Highlight rows in yellow and optionally show only matching rows."""
         needle = self.jira_filter_var.get().strip().lower()
-        for item in self.jira_tree.get_children(""):
-            values = self.jira_tree.item(item, "values") or ()
+        show_only_matches = self.jira_filter_only_var.get()
+
+        self._clear_jira_table(clear_cache=False)
+
+        visible_count = 0
+        for values in self._jira_all_rows:
             haystack = " ".join(str(v).lower() for v in values)
-            if needle and needle in haystack:
-                self.jira_tree.item(item, tags=("jira_filter_match",))
-            else:
-                self.jira_tree.item(item, tags=())
+            is_match = bool(needle) and needle in haystack
+            if show_only_matches and needle and not is_match:
+                continue
+
+            tags = ("jira_filter_match",) if is_match else ()
+            self.jira_tree.insert("", "end", values=values, tags=tags)
+            visible_count += 1
+
+        total_count = len(self._jira_all_rows)
+        if show_only_matches and needle:
+            self.jira_count_var.set(f"Visible: {visible_count} / {total_count} issues")
+        elif total_count:
+            self.jira_count_var.set(f"Total: {total_count} issues")
+        else:
+            self.jira_count_var.set("")
+
+        self._autofit_jira_columns()
 
     def _autofit_jira_columns(self):
         """Auto-fit JIRA columns to content and keep Summary visibly widest."""
@@ -778,6 +820,82 @@ class CIBugLogApp(tk.Tk):
             vals = self.jira_tree.item(sel[0], "values")
             self.clipboard_clear()
             self.clipboard_append("\t".join(vals))
+
+    def _on_jira_tree_motion(self, event):
+        """Schedule tooltip for Summary cell hover."""
+        row_id = self.jira_tree.identify_row(event.y)
+        col_id = self.jira_tree.identify_column(event.x)
+
+        if col_id != "#3" or not row_id:
+            self._hide_jira_summary_tooltip()
+            return
+
+        values = self.jira_tree.item(row_id, "values") or ()
+        summary_text = str(values[2]).strip() if len(values) > 2 else ""
+        if not summary_text:
+            self._hide_jira_summary_tooltip()
+            return
+
+        if self._jira_summary_hover_item == row_id and self._jira_summary_tooltip:
+            return
+
+        self._jira_summary_hover_item = row_id
+        if self._jira_summary_tooltip_job is not None:
+            self.after_cancel(self._jira_summary_tooltip_job)
+            self._jira_summary_tooltip_job = None
+
+        self._jira_summary_tooltip_job = self.after(
+            500,
+            lambda rid=row_id, text=summary_text: self._show_jira_summary_tooltip(rid, text),
+        )
+
+    def _show_jira_summary_tooltip(self, row_id: str, text: str):
+        """Show tooltip with full Summary text for hovered row."""
+        self._jira_summary_tooltip_job = None
+        if self._jira_summary_hover_item != row_id:
+            return
+
+        bbox = self.jira_tree.bbox(row_id, "#3")
+        if not bbox:
+            return
+
+        x, y, w, h = bbox
+        x_root = self.jira_tree.winfo_rootx() + x + 16
+        y_root = self.jira_tree.winfo_rooty() + y + h + 8
+
+        if self._jira_summary_tooltip is None:
+            tip = tk.Toplevel(self)
+            tip.wm_overrideredirect(True)
+            tip.wm_attributes("-topmost", True)
+            label = tk.Label(
+                tip,
+                text=text,
+                justify="left",
+                anchor="w",
+                background="#fff8dc",
+                relief="solid",
+                borderwidth=1,
+                padx=8,
+                pady=4,
+                wraplength=900,
+            )
+            label.pack(fill="both", expand=True)
+            self._jira_summary_tooltip = tip
+            self._jira_summary_tooltip_label = label
+        else:
+            self._jira_summary_tooltip_label.configure(text=text)
+
+        self._jira_summary_tooltip.geometry(f"+{x_root}+{y_root}")
+        self._jira_summary_tooltip.deiconify()
+
+    def _hide_jira_summary_tooltip(self, _event=None):
+        """Hide Summary tooltip and cancel pending tooltip timers."""
+        self._jira_summary_hover_item = None
+        if self._jira_summary_tooltip_job is not None:
+            self.after_cancel(self._jira_summary_tooltip_job)
+            self._jira_summary_tooltip_job = None
+        if self._jira_summary_tooltip is not None:
+            self._jira_summary_tooltip.withdraw()
 
     # ---------------------------------------------------------- helpers ------
 
@@ -1453,5 +1571,22 @@ class CIBugLogApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = CIBugLogApp()
-    app.mainloop()
+    try:
+        app = CIBugLogApp()
+        app.mainloop()
+    except tk.TclError as exc:
+        msg = (
+            "Unable to start the GUI because Tcl/Tk could not be initialized.\n\n"
+            f"Details: {exc}\n\n"
+            "Common fixes:\n"
+            "1. Reinstall Python and include the Tcl/Tk component.\n"
+            "2. Run with the same interpreter used by this project (.venv if present).\n"
+            "3. If running remotely/headless, start from a desktop session with GUI access."
+        )
+        print(msg, file=sys.stderr)
+        try:
+            messagebox.showerror("CIBugLog GUI startup failed", msg)
+        except tk.TclError:
+            # If Tk itself cannot render dialogs, stderr output above is the fallback.
+            pass
+        raise SystemExit(1)
