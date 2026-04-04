@@ -77,6 +77,11 @@ class TestCIBugLogHelpers(unittest.TestCase):
         text = "IGT: result   (external URL)  value  "
         self.assertEqual(gui.clean_cell(text), "result value")
 
+    def test_clean_cell_external_url_with_spaces_inside_parentheses(self):
+        """Test removal of marker variant '( external URL )'."""
+        text = "skip ( external URL )"
+        self.assertEqual(gui.clean_cell(text), "skip")
+
     def test_external_link_marker(self):
         self.assertTrue(gui._is_external_link_marker("external URL"))
         self.assertTrue(gui._is_external_link_marker("(External   Url)"))
@@ -347,6 +352,26 @@ class TestCIBugLogHelpers(unittest.TestCase):
         # Both should produce the same result (no double slashes)
         self.assertEqual(url_with_slash, url_without_slash)
         self.assertNotIn("//tree", url_with_slash)
+
+    def test_split_runconfig_name_and_date_with_parentheses(self):
+        name, date = gui._split_runconfig_name_and_date("xe-1181-nvl-resume (1 day old)")
+        self.assertEqual(name, "xe-1181-nvl-resume")
+        self.assertEqual(date, "1 day old")
+
+    def test_split_runconfig_name_and_date_with_iso_date(self):
+        name, date = gui._split_runconfig_name_and_date("xe-1181-nvl-resume 2026-04-01 09:15")
+        self.assertEqual(name, "xe-1181-nvl-resume")
+        self.assertEqual(date, "2026-04-01 09:15")
+
+    def test_split_runconfig_name_and_date_plain_name(self):
+        name, date = gui._split_runconfig_name_and_date("xe-1181-nvl-resume")
+        self.assertEqual(name, "xe-1181-nvl-resume")
+        self.assertEqual(date, "")
+
+    def test_split_runconfig_name_and_date_empty(self):
+        name, date = gui._split_runconfig_name_and_date("")
+        self.assertEqual(name, "")
+        self.assertEqual(date, "")
 
 
 class TestQueryBuilder(unittest.TestCase):

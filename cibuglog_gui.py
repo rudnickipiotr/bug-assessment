@@ -81,7 +81,7 @@ def classify_status(status_text: str) -> str:
 
 
 def clean_cell(text: str) -> str:
-    text = re.sub(r"\(external\s*URL\)", "", text)
+    text = re.sub(r"\(\s*external\s*url\s*\)", "", text, flags=re.I)
     text = re.sub(r"^IGT:\s*", "", text)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -169,6 +169,25 @@ def _build_tree_url_from_row(
         f"{cibuglog_origin.rstrip('/')}/tree/xe/{build_id}/"
         f"{machine_part}/{test_part}.html"
     )
+
+
+def _split_runconfig_name_and_date(runconfig_text: str) -> tuple[str, str]:
+    """Split combined runconfig text into name and trailing date/age marker."""
+    text = (runconfig_text or "").strip()
+    if not text:
+        return "", ""
+
+    m = re.match(r"^(.*?)\s*\(([^()]*)\)\s*$", text)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+
+    m = re.search(r"\b(\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2})?)\b", text)
+    if m:
+        date_part = m.group(1).strip()
+        name_part = text.replace(date_part, "").strip(" -|")
+        return name_part, date_part
+
+    return text, ""
 
 
 class CIBugLogApp(tk.Tk):
@@ -338,16 +357,17 @@ class CIBugLogApp(tk.Tk):
         tframe.rowconfigure(0, weight=1)
         tframe.columnconfigure(0, weight=1)
 
-        cols = ("test", "runconfig", "tags", "status", "build", "issue")
+        cols = ("test", "machine", "tags", "status", "runconfig", "runconfig_date", "issue")
         self.tree = ttk.Treeview(tframe, columns=cols, show="headings", selectmode="extended")
 
         col_cfg = [
             ("test",      "Test Name",   340),
-            ("runconfig", "Machine",     220),
+            ("machine",   "Machine",     220),
             ("tags",      "Tags",        160),
             ("status",    "Status",      110),
-            ("build",     "Run Config",  220),
-            ("issue",     "Issue",       320),
+            ("runconfig", "Run Config",  220),
+            ("runconfig_date", "Date",   130),
+            ("issue",     "Issue",       280),
         ]
         for cid, heading, width in col_cfg:
             self.tree.heading(cid, text=heading,
@@ -1363,8 +1383,9 @@ class CIBugLogApp(tk.Tk):
                     display[2],
                 )
 
-            # drop duration (index 4) — not shown in table
-            display_row = display[:4] + display[5:]
+            # drop duration (index 4) and split runconfig text into name/date.
+            runconfig_name, runconfig_date = _split_runconfig_name_and_date(display[5])
+            display_row = display[:4] + [runconfig_name, runconfig_date, display[6]]
 
             iid = self.tree.insert("", "end", values=display_row,
                                    tags=(tag,) if tag else ())
@@ -1383,6 +1404,8 @@ class CIBugLogApp(tk.Tk):
             if _is_external_link_marker(status_raw) and tree_url:
                 if not self._item_external_url.get(iid):
                     self._item_external_url[iid] = tree_url
+
+        self._autofit_cibuglog_columns()
 
     def _on_error(self, msg: str):
         self.progress.stop()
@@ -1406,6 +1429,41 @@ class CIBugLogApp(tk.Tk):
 
     # ---------------------------------------------------------- table utils --
 
+    def _autofit_cibuglog_columns(self):
+        """Auto-fit CIBugLog columns to content after loading rows."""
+        cols = ("test", "machine", "tags", "status", "runconfig", "runconfig_date", "issue")
+        cell_font = tkfont.nametofont("TkDefaultFont")
+        tags_max_px = cell_font.measure("W" * 15) + 20
+
+        widths: dict[str, int] = {}
+        for col in cols:
+            heading_text = self.tree.heading(col, "text") or col
+            max_px = cell_font.measure(str(heading_text)) + 26
+            for item in self.tree.get_children(""):
+                value = self.tree.set(item, col)
+                max_px = max(max_px, cell_font.measure(str(value)) + 20)
+            widths[col] = max_px
+
+        caps = {
+            "test": (120, 820),
+            "machine": (150, 360),
+            "tags": (90, tags_max_px),
+            "status": (70, 120),
+            "runconfig": (90, 520),
+            "runconfig_date": (80, 220),
+            "issue": (180, 820),
+        }
+        for col, (min_w, max_w) in caps.items():
+            widths[col] = max(min_w, min(max_w, widths[col]))
+
+        for col in cols:
+            self.tree.column(
+                col,
+                width=widths[col],
+                minwidth=60,
+                stretch=(col == "issue"),
+            )
+
     def _sort_column(self, col: str):
         rev = self._sort_reverse.get(col, False)
         data = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
@@ -1415,9 +1473,9 @@ class CIBugLogApp(tk.Tk):
         self._sort_reverse[col] = not rev
         arrow = " ↑" if rev else " ↓"
         col_cfg = {
-            "test": "Test Name", "runconfig": "Machine", "tags": "Tags",
+            "test": "Test Name", "machine": "Machine", "tags": "Tags",
             "status": "Status",
-            "build": "Run Config", "issue": "Issue",
+            "runconfig": "Run Config", "runconfig_date": "Date", "issue": "Issue",
         }
         for c, lbl in col_cfg.items():
             self.tree.heading(c, text=lbl + (arrow if c == col else ""))
@@ -1556,7 +1614,7 @@ class CIBugLogApp(tk.Tk):
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(["Test Name", "Machine", "Tags",
-                         "Status", "Run Config", "Issue"])
+                         "Status", "Run Config", "Date", "Issue"])
         writer.writerows(rows)
         self.clipboard_clear()
         self.clipboard_append(buf.getvalue())
