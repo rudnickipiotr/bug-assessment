@@ -5,6 +5,96 @@ import cibuglog_gui as gui
 
 
 class TestCIBugLogHelpers(unittest.TestCase):
+    def test_normalized_person_tokens(self):
+        tokens = gui._normalized_person_tokens(
+            {
+                "accountId": " A1 ",
+                "displayName": "Alice Smith",
+                "emailAddress": "Alice.Smith@intel.com",
+                "name": "asmith",
+                "key": "U-123",
+            }
+        )
+        self.assertIn("a1", tokens)
+        self.assertIn("alice smith", tokens)
+        self.assertIn("alice.smith@intel.com", tokens)
+        self.assertIn("asmith", tokens)
+        self.assertIn("u-123", tokens)
+
+    def test_extract_last_comment_info_ignores_invalid_rows(self):
+        comment_field = {
+            "comments": [
+                None,
+                {"created": ""},
+                {
+                    "created": "2026-04-05T08:00:00.000+0000",
+                    "author": "not-a-dict",
+                },
+            ]
+        }
+        self.assertEqual(
+            gui._extract_last_comment_info(comment_field),
+            ("2026-04-05T08:00:00.000+0000", {}),
+        )
+
+    def test_is_last_comment_author_assignee_matches_by_email(self):
+        self.assertTrue(
+            gui._is_last_comment_author_assignee(
+                {"emailAddress": "a.user@intel.com"},
+                {"emailAddress": "A.USER@intel.com"},
+            )
+        )
+
+    def test_is_last_comment_author_assignee_requires_overlap(self):
+        self.assertFalse(gui._is_last_comment_author_assignee({}, {}))
+        self.assertFalse(
+            gui._is_last_comment_author_assignee(
+                {"displayName": "Alice"},
+                {"displayName": "Bob"},
+            )
+        )
+
+    def test_extract_last_comment_info(self):
+        comment_field = {
+            "comments": [
+                {
+                    "created": "2026-04-01T10:00:00.000+0000",
+                    "author": {"accountId": "A1", "displayName": "User A"},
+                },
+                {
+                    "created": "2026-04-03T09:30:00.000+0000",
+                    "author": {"accountId": "B2", "displayName": "User B"},
+                },
+            ]
+        }
+        self.assertEqual(
+            gui._extract_last_comment_info(comment_field),
+            (
+                "2026-04-03T09:30:00.000+0000",
+                {"accountId": "B2", "displayName": "User B"},
+            ),
+        )
+
+    def test_is_last_comment_author_assignee(self):
+        self.assertTrue(
+            gui._is_last_comment_author_assignee(
+                {"accountId": "A1", "displayName": "Alice"},
+                {"accountId": "A1", "displayName": "Alice"},
+            )
+        )
+        self.assertTrue(
+            gui._is_last_comment_author_assignee(
+                {"displayName": "Alice Smith"},
+                {"displayName": "alice smith"},
+            )
+        )
+        self.assertFalse(
+            gui._is_last_comment_author_assignee(
+                {"accountId": "A1"},
+                {"accountId": "B2"},
+            )
+        )
+
     def test_extract_last_comment_created(self):
         comment_field = {
             "comments": [

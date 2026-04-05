@@ -221,23 +221,56 @@ def _should_show_updated_for_preset(preset_name: str) -> bool:
 
 def _extract_last_comment_created(comment_field) -> str:
     """Extract the newest comment 'created' timestamp from JIRA comment field."""
+    created_raw, _ = _extract_last_comment_info(comment_field)
+    return created_raw
+
+
+def _extract_last_comment_info(comment_field) -> tuple[str, dict]:
+    """Return (created, author_dict) for newest comment."""
     if not isinstance(comment_field, dict):
-        return ""
+        return "", {}
     comments = comment_field.get("comments", [])
     if not isinstance(comments, list) or not comments:
-        return ""
+        return "", {}
 
-    created_values = []
+    newest = None
     for comment in comments:
         if not isinstance(comment, dict):
             continue
         created_raw = str(comment.get("created", "") or "").strip()
-        if created_raw:
-            created_values.append(created_raw)
+        if not created_raw:
+            continue
 
-    if not created_values:
-        return ""
-    return max(created_values)
+        author = comment.get("author")
+        if not isinstance(author, dict):
+            author = {}
+        row = (created_raw, author)
+        if newest is None or created_raw > newest[0]:
+            newest = row
+
+    if newest is None:
+        return "", {}
+    return newest
+
+
+def _normalized_person_tokens(person) -> set[str]:
+    """Return normalized identity tokens for matching JIRA user objects."""
+    if not isinstance(person, dict):
+        return set()
+
+    tokens = set()
+    for key in ("accountId", "name", "key", "displayName", "emailAddress"):
+        raw = str(person.get(key, "") or "").strip().lower()
+        if raw:
+            tokens.add(raw)
+    return tokens
+
+
+def _is_last_comment_author_assignee(last_comment_author: dict, assignee: dict) -> bool:
+    """Check if last comment author is the current assignee of the issue."""
+    author_tokens = _normalized_person_tokens(last_comment_author)
+    assignee_tokens = _normalized_person_tokens(assignee)
+    return bool(author_tokens and assignee_tokens and (author_tokens & assignee_tokens))
 
 
 class CIBugLogApp(tk.Tk):
@@ -517,6 +550,8 @@ class CIBugLogApp(tk.Tk):
         self.jira_query_text = tk.Text(qframe, font=("Consolas", 9), height=3, width=100)
         self.jira_query_text.pack(fill="both", expand=False, padx=6, pady=4)
         self.jira_query_text.insert("1.0", default_jql)
+        self.jira_query_text.bind("<KeyRelease>", self._on_jira_query_text_changed)
+        self.jira_query_text.bind("<<Paste>>", self._on_jira_query_text_changed)
         
         # ---- Action Buttons ----
         btn_frame = ttk.Frame(self.jira_frame)
@@ -565,7 +600,9 @@ class CIBugLogApp(tk.Tk):
         tframe.rowconfigure(0, weight=1)
         tframe.columnconfigure(0, weight=1)
         
-        cols = ("key", "created", "last_comment", "summary", "labels", "status", "priority", "assignee")
+        cols = (
+            "key", "created", "last_comment", "auth", "summary", "labels", "status", "priority", "assignee"
+        )
         self._jira_columns = cols
         self.jira_tree = ttk.Treeview(tframe, columns=cols, show="headings", selectmode="extended")
         
@@ -573,6 +610,7 @@ class CIBugLogApp(tk.Tk):
             ("key",      "Key",       100),
             ("created",  "Created",   135),
             ("last_comment", "Last comment", 135),
+            ("auth",     "Auth",      70),
             ("summary",  "Summary",   420),
             ("labels",   "Labels",    160),
             ("status",   "Status",    100),
@@ -611,6 +649,7 @@ class CIBugLogApp(tk.Tk):
         # Store sort state for JIRA table
         self._jira_sort_reverse = {}
         self._jira_all_rows = []
+        self._jira_results_query = ""
         self._jira_summary_tooltip = None
         self._jira_summary_tooltip_label = None
         self._jira_summary_tooltip_job = None
@@ -651,6 +690,21 @@ class CIBugLogApp(tk.Tk):
         """Set JQL text widget content."""
         self.jira_query_text.delete("1.0", "end")
         self.jira_query_text.insert("1.0", jql)
+        self._clear_jira_results_if_query_changed()
+
+    def _on_jira_query_text_changed(self, _event=None):
+        """Clear stale JIRA results when query text is edited."""
+        self._clear_jira_results_if_query_changed()
+
+    def _clear_jira_results_if_query_changed(self):
+        """Clear table only when current query differs from last populated query."""
+        current_query = self._get_jira_query()
+        if not self._jira_results_query or current_query == self._jira_results_query:
+            return
+
+        self._clear_jira_table()
+        self.jira_count_var.set("")
+        self.jira_status_label.configure(text="Query changed - results cleared", foreground="gray")
 
     def _on_jira_preset_selected(self, _event=None):
         """Load selected JQL preset into query text box."""
@@ -699,6 +753,8 @@ class CIBugLogApp(tk.Tk):
         display_cols = []
         for col in self._jira_columns:
             if col == "last_comment" and not self.jira_show_updated_var.get():
+                continue
+            if col == "auth" and not self.jira_show_updated_var.get():
                 continue
             if col == "priority" and not show_priority:
                 continue
@@ -783,12 +839,13 @@ class CIBugLogApp(tk.Tk):
                 def populate():
                     self.jira_progress.stop()
                     self._populate_jira_table(all_issues)
+                    self._jira_results_query = jql
                     self.jira_count_var.set(f"Total: {len(all_issues)} issues")
                     self.jira_status_label.configure(text="Done", foreground="gray")
                 
                 self.after(0, populate)
                 
-            except requests.exceptions.ConnectionError as exc:
+            except requests.exceptions.ConnectionError:
                 def show_conn_error():
                     self.jira_progress.stop()
                     self.jira_status_label.configure(
@@ -797,19 +854,23 @@ class CIBugLogApp(tk.Tk):
                 self.after(0, show_conn_error)
                 
             except requests.exceptions.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else "?"
+
                 def show_http_error():
                     self.jira_progress.stop()
                     self.jira_status_label.configure(
-                        text=f"Error: HTTP {exc.response.status_code}", foreground="red")
+                        text=f"Error: HTTP {status_code}", foreground="red")
                     self.jira_count_var.set("—")
                 self.after(0, show_http_error)
                 
             except Exception as exc:
                 import traceback
+                err_text = f"{type(exc).__name__}: {str(exc)[:50]}"
+
                 def show_generic_error():
                     self.jira_progress.stop()
                     self.jira_status_label.configure(
-                        text=f"Error: {type(exc).__name__}: {str(exc)[:50]}", foreground="red")
+                        text=f"Error: {err_text}", foreground="red")
                     self.jira_count_var.set("—")
                 self.after(0, show_generic_error)
                 print(f"JIRA fetch error: {traceback.format_exc()}", file=sys.stderr)
@@ -832,9 +893,8 @@ class CIBugLogApp(tk.Tk):
             fields = issue.get("fields", {})
             key = issue.get("key", "")
             created = self._format_jira_created(fields.get("created", ""))
-            last_comment = self._format_jira_created(
-                _extract_last_comment_created(fields.get("comment", {}))
-            )
+            last_comment_created_raw, last_comment_author = _extract_last_comment_info(fields.get("comment", {}))
+            last_comment = self._format_jira_created(last_comment_created_raw)
             summary = fields.get("summary", "")
             status = fields.get("status", {})
             status_name = status.get("name", "") if isinstance(status, dict) else str(status)
@@ -844,8 +904,13 @@ class CIBugLogApp(tk.Tk):
             priority = fields.get("priority", {})
             priority_name = priority.get("name", "") if isinstance(priority, dict) else str(priority)
             assignee = fields.get("assignee")
+            if not isinstance(assignee, dict):
+                assignee = {}
             assignee_name = assignee.get("displayName", "Unassigned") if assignee else "Unassigned"
-            all_rows.append((key, created, last_comment, summary, labels_name, status_name, priority_name, assignee_name))
+            auth = "Y" if _is_last_comment_author_assignee(last_comment_author, assignee) else ""
+            all_rows.append((
+                key, created, last_comment, auth, summary, labels_name, status_name, priority_name, assignee_name
+            ))
 
         self._jira_all_rows = all_rows
         self._apply_jira_filter_highlight()
@@ -901,6 +966,7 @@ class CIBugLogApp(tk.Tk):
             "key": (90, 180),
             "created": (120, 190),
             "last_comment": (120, 190),
+            "auth": (60, 80),
             "status": (90, 170),
             "priority": (90, 170),
             "labels": (120, 360),
